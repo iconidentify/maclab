@@ -1,0 +1,173 @@
+package server
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/iconidentify/maclab/internal/api"
+	"github.com/iconidentify/maclab/internal/detect"
+)
+
+// Serial-based early detection: don't sit out the whole boot timeout when the
+// console already shows the Mac is stuck.
+var (
+	panicGrace  = 60 * time.Second  // panic=10 should have rebooted it well within this
+	serialStall = 120 * time.Second // console silent mid-boot for this long = hung
+)
+
+// waitBack waits for the Mac to come up on a new boot after `since`. When it
+// doesn't, it walks the recovery ladder. It returns the ladder steps used and
+// whether the Mac is back.
+func (v *dev) waitBack(ctx context.Context, oldBoot string, since time.Time, timeout time.Duration) ([]string, bool, error) {
+	var reason string
+	err := v.waitFor(ctx, timeout, func() bool {
+		if v.d.BootID != oldBoot && v.d.LastSeen.After(since) {
+			return true
+		}
+		now := time.Now()
+		for _, e := range v.events {
+			if e.Time.After(since) && e.Kind == detect.Panic && now.Sub(e.Time) > panicGrace {
+				reason = "kernel panicked and did not reboot within " + panicGrace.String()
+				return true
+			}
+		}
+		if v.oob != nil && v.serialUp && v.serialLast.After(since) && now.Sub(v.serialLast) > serialStall &&
+			v.marker != detect.MarkUserspace && !v.aliveLocked() {
+			reason = fmt.Sprintf("boot stalled: serial console silent for %s after %q", now.Sub(v.serialLast).Round(time.Second), v.serialLine)
+			return true
+		}
+		return false
+	})
+	if err != nil && err != context.DeadlineExceeded {
+		return nil, false, err
+	}
+	v.mu.Lock()
+	back := v.d.BootID != oldBoot && v.d.LastSeen.After(since)
+	// A Mac that is going down stops talking within seconds. Only one still
+	// checking in well after the reboot request never went down at all.
+	stillUp := v.d.BootID == oldBoot && v.aliveLocked() && v.d.LastSeen.After(since.Add(15*time.Second))
+	v.mu.Unlock()
+	if back {
+		return nil, true, nil
+	}
+	if reason == "" {
+		if stillUp {
+			reason = fmt.Sprintf("still on the old boot %s after asking it to reboot", timeout)
+		} else {
+			reason = fmt.Sprintf("did not check in within %s", timeout)
+		}
+	}
+	steps, ok := v.ladder(ctx, reason, timeout, stillUp)
+	return steps, ok, nil
+}
+
+// ladder is the recovery ladder: soft reboot, hard reset (twice), then a
+// human. It returns the steps taken and whether the Mac came back.
+func (v *dev) ladder(ctx context.Context, reason string, bootTimeout time.Duration, trySoft bool) ([]string, bool) {
+	v.mu.Lock()
+	stuck := v.d.BootID
+	alive := trySoft && v.aliveLocked()
+	ctl := v.oob
+	prev := v.d.State
+	v.mu.Unlock()
+	v.setState(api.StateRecovering, reason)
+	v.s.log.Printf("%s: recovering: %s", v.d.Name, reason)
+	steps := []string{"detected: " + reason}
+
+	backSince := func(t time.Time) func() bool {
+		return func() bool { return v.d.BootID != stuck && v.d.LastSeen.After(t) }
+	}
+	done := func() ([]string, bool) {
+		v.setState(prev, "")
+		return steps, true
+	}
+
+	if alive {
+		steps = append(steps, "soft reboot via agent")
+		t0 := time.Now()
+		v.send(api.CmdReboot, "", nil)
+		v.rearmSerial(3 * time.Minute)
+		if v.waitFor(ctx, bootTimeout, backSince(t0)) == nil {
+			return done()
+		}
+		steps = append(steps, "soft reboot did not bring it back")
+	}
+	if ctl != nil {
+		for i := 1; i <= 2; i++ {
+			if ctx.Err() != nil {
+				return steps, false
+			}
+			t0 := time.Now()
+			steps = append(steps, fmt.Sprintf("hard reset %d via %s", i, ctl.Name()))
+			rctx, cancel := context.WithTimeout(ctx, time.Minute)
+			err := ctl.Reset(rctx)
+			cancel()
+			if err != nil {
+				steps = append(steps, "hard reset failed: "+err.Error())
+				continue
+			}
+			if v.waitFor(ctx, bootTimeout, backSince(t0)) == nil {
+				return done()
+			}
+			steps = append(steps, fmt.Sprintf("no check-in %s after hard reset %d", bootTimeout, i))
+		}
+	}
+	if ctx.Err() != nil {
+		return steps, false
+	}
+	v.mu.Lock()
+	act := humanAction(v.d, reason, v.lastLogLocked())
+	v.d.Action = act
+	v.restore = ""
+	v.setStateLocked(api.StateNeedsHands, reason)
+	v.dirty = true
+	v.mu.Unlock()
+	steps = append(steps, "asked a human to power cycle it")
+	v.s.notify(Notification{Device: v.d.Name, Title: act.Title, Body: act.Text(), Priority: "urgent"})
+	return steps, false
+}
+
+func (v *dev) lastLogLocked() string {
+	for i := len(v.events) - 1; i >= 0; i-- {
+		if detect.Fatal(v.events[i].Kind) {
+			return v.events[i].Line
+		}
+	}
+	if v.serialLine != "" {
+		return v.serialLine
+	}
+	return ""
+}
+
+// humanAction writes the instruction for the person at the desk: which
+// machine, exactly what to press, and that nothing else is needed.
+func humanAction(d api.Device, reason, lastLog string) *api.HumanAction {
+	where := d.Name
+	if d.Label != "" {
+		where = fmt.Sprintf("%s (%s)", d.Name, d.Label)
+	}
+	a := &api.HumanAction{Title: d.Name + " needs a power cycle", LastLog: lastLog, Since: time.Now()}
+	switch d.Model {
+	case api.ModelDesktop:
+		a.Steps = []string{
+			"Find " + where + ".",
+			"Unplug its power cable and wait 10 seconds.",
+			"Plug it back in. If it doesn't start, press the power button on the back once.",
+		}
+	default:
+		a.Steps = []string{
+			"Find " + where + ". Open the lid if it's closed.",
+			"Hold the power button (the Touch ID key, top right of the keyboard) for 10 seconds, until the screen stays black.",
+			"Wait 5 seconds, then press it once to turn it back on.",
+		}
+	}
+	a.Steps = append(a.Steps, "That's it. The lab notices when it checks in again and picks up from there.")
+	a.Why = reason
+	if d.OOB == nil {
+		a.Why += ". No out-of-band controller is attached, so the lab can't reset it remotely"
+	} else {
+		a.Why += ". Two remote resets did not bring it back"
+	}
+	return a
+}

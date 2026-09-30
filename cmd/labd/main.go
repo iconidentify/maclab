@@ -1,0 +1,90 @@
+// Command labd is the Mac test lab controller.
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/iconidentify/maclab/internal/server"
+)
+
+func main() {
+	home, _ := os.UserHomeDir()
+	listen := flag.String("listen", ":7770", "address to serve the API on (agents must reach it)")
+	data := flag.String("data", filepath.Join(home, ".local/share/maclab"), "data directory")
+	ntfy := flag.String("ntfy", os.Getenv("MACLAB_NTFY"), "ntfy topic URL for notifications, e.g. https://ntfy.sh/<secret-topic>")
+	notifyCmd := flag.String("notify-cmd", os.Getenv("MACLAB_NOTIFY_CMD"), `shell command run per notification with $MACLAB_TITLE/$MACLAB_BODY, e.g. 'notify-send "$MACLAB_TITLE" "$MACLAB_BODY"'`)
+	bootTimeout := flag.Duration("boot-timeout", 4*time.Minute, "default time a Mac gets to come back after a reboot")
+	artifactGB := flag.Int64("artifact-budget-gb", 20, "cap on the kernel artifact store; unreferenced artifacts go first")
+	trust := flag.String("trust", os.Getenv("MACLAB_TRUST"), "networks that get admin access without a token, e.g. 192.168.1.0/24,127.0.0.1 (anyone there can reboot Macs and run commands on them)")
+	flag.Parse()
+	trusted, err := server.ParseTrust(*trust)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if err := os.MkdirAll(*data, 0o700); err != nil {
+		log.Fatal(err)
+	}
+	tokPath := filepath.Join(*data, "admin.token")
+	tok, err := os.ReadFile(tokPath)
+	if os.IsNotExist(err) {
+		tok = []byte("adm_" + randHex())
+		if err := os.WriteFile(tokPath, tok, 0o600); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("created admin token in %s\n  lab login http://<this-host>%s \"$(cat %s)\"\n", tokPath, *listen, tokPath)
+	} else if err != nil {
+		log.Fatal(err)
+	}
+
+	btokPath := filepath.Join(*data, "builder.token")
+	btok, err := os.ReadFile(btokPath)
+	if os.IsNotExist(err) {
+		btok = []byte("bld_" + randHex())
+		if err := os.WriteFile(btokPath, btok, 0o600); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("created builder token in %s (give it to lab-builder)\n", btokPath)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if len(trusted) > 0 {
+		log.Printf("no token needed from %s", *trust)
+	}
+	s, err := server.New(ctx, server.Config{DataDir: *data, AdminToken: strings.TrimSpace(string(tok)), Trust: trusted,
+		BootTimeout: *bootTimeout, NtfyURL: *ntfy, NotifyCmd: *notifyCmd,
+		BuilderToken: strings.TrimSpace(string(btok)), ArtifactBudget: *artifactGB << 30}, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	hs := &http.Server{Addr: *listen, Handler: s.Handler()}
+	go func() {
+		<-ctx.Done()
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		hs.Shutdown(sctx)
+	}()
+	log.Printf("labd listening on %s, data in %s", *listen, *data)
+	if err := hs.ListenAndServe(); err != http.ErrServerClosed {
+		log.Fatal(err)
+	}
+}
+
+func randHex() string {
+	b := make([]byte, 20)
+	f, _ := os.Open("/dev/urandom")
+	f.Read(b)
+	f.Close()
+	return fmt.Sprintf("%x", b)
+}

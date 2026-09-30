@@ -1,0 +1,18 @@
+# systemd user unit: cp to ~/.config/systemd/user/ and `systemctl --user enable --now labd`
+# (run `loginctl enable-linger $USER` so it keeps running when you log out)
+[Unit]
+Description=maclab controller
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/labd --listen :7770
+Restart=always
+RestartSec=3
+# Trust your LAN to skip the admin token in the browser. Anyone on these
+# networks can then reboot Macs and run commands on them.
+# Environment=MACLAB_TRUST=192.168.1.0/24,127.0.0.1
+# Environment=MACLAB_NTFY=https://ntfy.sh/<secret-topic>
+# Environment=MACLAB_NOTIFY_CMD=notify-send -u critical "$MACLAB_TITLE" "$MACLAB_BODY"
+
+[Install]
+WantedBy=default.target

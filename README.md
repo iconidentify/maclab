@@ -1,0 +1,289 @@
+# maclab
+
+A test lab for Omarchy Macs. Hand it a kernel, and it boots that kernel exactly
+once on a real Apple Silicon Mac. It then runs tests (including Wayland GUI
+tests), collects logs, and puts the Mac back on its known-good kernel. When a
+kernel crashes or hangs the machine, the lab gets the Mac back itself. When it
+can't, it tells a person exactly what to press.
+
+```
+lab run m1air --kernel kernel-7.2.0-rc1-lab1.tar.zst --gui-test gui-smoke
+```
+
+AI agents get the same operations over MCP (`lab mcp`).
+
+## Pieces
+
+| Binary | Runs on | Job |
+|---|---|---|
+| `labd` | any Linux box | Controller: devices, leases, job queue, recovery ladder, notifications, artifact and log store |
+| `lab-agent` | each test Mac (Omarchy/Asahi, aarch64) | Heartbeat. Stages kernels beside the known-good one, arms the one-shot boot, runs tests, uploads logs |
+| `oobd` | the controller host wired to a test Mac's DFU port | Hard reset and serial console. Today: a macOS Mac running `macvdmtool`. Later: a Linux box with a Central Scrutinizer |
+| `lab` | your machine | CLI, and `lab mcp` for agents |
+
+## How a job runs
+
+1. **Stage.** The agent downloads the artifact, installs its modules under
+   `/usr/lib/modules/<release>` (refusing any release it didn't install
+   itself), builds an initramfs, and writes a GRUB entry to
+   `/boot/grub/maclab.cfg`. The known-good kernel is never touched.
+2. **Boot once.** The agent sets `maclab_next=<entry>` in `maclab.env` on the
+   ESP and reboots. GRUB selects the entry and **clears the flag before
+   booting it**. Any reset afterwards, for any reason, lands on the
+   known-good kernel. (GRUB can't write `grubenv` on btrfs, so a plain
+   `grub-reboot` would never clear. That's why the flag lives on the FAT ESP.)
+3. **Watch.** labd waits for a check-in from the new boot. The boot is tagged
+   `maclab.job=<id>` on the kernel command line, so labd can tell "booted the
+   test kernel" from "fell back". On Macs with an OOB controller, labd also
+   reads the serial console and classifies panics, oopses, RCU stalls and
+   lockups as they happen.
+4. **Test.** `boot-health` always runs. It is followed by any builtin tests
+   (`gui-smoke`, `gui-terminal`) or your own scripts. GUI tests run inside the
+   GUI user's Hyprland session. Anything written to `$MACLAB_OUT` comes back
+   with the job.
+5. **Collect.** The journal, kernel log and serial console are saved.
+   Warnings and errors that aren't in the Mac's baseline are listed as
+   `new_error_lines`.
+6. **Restore.** The agent reboots to the known-good kernel, checks that the
+   one-shot really cleared, and removes the staged kernel.
+
+Outcomes: `pass`, `tests_failed`, `booted_unhealthy`, `panicked`, `hung`,
+`boot_failed`, `stage_failed`, `infra_error`, `canceled`.
+
+## When things go wrong
+
+labd notices a problem from any of these signals:
+
+- The heartbeat stops.
+- The boot ID doesn't change after a reboot.
+- The Mac comes back on the known-good kernel.
+- A panic appears on serial, and the Mac doesn't reboot within 60s.
+- The serial console goes silent mid-boot for 2 minutes.
+
+It then climbs a ladder:
+
+1. Soft reboot through the agent, if the agent still answers.
+2. Hard reset through the OOB controller, up to twice.
+3. **Ask a human.** The Mac goes to `needs_hands`, and one urgent
+   notification goes out (ntfy and/or a command such as `notify-send`):
+
+   > **m1air needs a power cycle**
+   > 1. Find m1air (MacBook Air M1, left desk). Open the lid if it's closed.
+   > 2. Hold the power button (the Touch ID key, top right of the keyboard) for 10 seconds, until the screen stays black.
+   > 3. Wait 5 seconds, then press it once to turn it back on.
+   > 4. That's it. The lab notices when it checks in again and picks up from there.
+
+When the Mac checks in again, the alert clears, leftover staged kernels are
+removed, and queued jobs continue. `lab status` shows the same instruction
+while it's outstanding.
+
+Each Mac gets a recovery tier: 0 = panic reboot + one-shot fallback,
+1 = + hardware watchdog (`apple_wdt`, armed through systemd),
+2 = + out-of-band reset and serial.
+
+## Setup
+
+```sh
+make                                 # binaries in bin/
+labd                                 # prints the admin token on first start
+lab login http://<labd-host>:7770 <admin-token>
+lab enroll m1air --label "MacBook Air M1, left desk"
+```
+
+On the Mac:
+
+```sh
+sudo ./lab-agent setup --server http://<labd-host>:7770 --token enr_... --gui-user <you> --autologin
+```
+
+`setup` makes these changes. Each one is idempotent and backed up:
+
+- Appends the one-shot hook to `/boot/grub/custom.cfg` (backup: `custom.cfg.pre-maclab`).
+- Creates `maclab.env` on the ESP.
+- Records the running kernel as known-good.
+- Sets `kernel.panic = 10`.
+- Arms the hardware watchdog (`RuntimeWatchdogSec=30s`).
+- Installs and starts `lab-agent.service`.
+
+Then run the baseline:
+
+```sh
+lab baseline m1air    # two reboots: proves the one-shot selects AND clears
+lab crashtest m1air   # optional: deliberate panic, checks it recovers by itself
+```
+
+No other job runs on a Mac until its baseline passes.
+
+### Out-of-band control from a macOS host
+
+On the controller Mac, build `macvdmtool` (Xcode command line tools).
+Connect its DFU port to the test Mac's DFU port with a USB-C cable that isn't
+USB 2.0-only.
+
+**Step zero:** check that `sudo macvdmtool nop` reports a connection and that
+`sudo macvdmtool reboot serial` resets the target. Only then install `oobd` using
+`deploy/com.maclab.oobd.plist`, and point labd at it:
+
+```sh
+lab device m1air --oob-url http://<controller-host>:7780 --oob-token <token>
+lab oob m1air
+```
+
+`macvdmtool` only drives one port, so it's one controller Mac per test Mac.
+
+## Live data: stream, screen, logs, shell
+
+Everything a UI needs is on the API. The web UI uses it now, and a TUI can use it later.
+
+- `GET /api/stream`: server-sent events for `device`, `job`, `serial`, `kevent` and `screen` (`?device=` limits it to one Mac).
+- `POST /api/devices/{n}/screenshot`, `GET .../screen`, `.../screens`: captures come from the display
+  controller via `ffmpeg kmsgrab`. That works from the moment the display driver loads (boot splash,
+  text console, emergency shell, login screen, desktop), with `grim` as a fallback. Jobs capture
+  `screen/after-boot.jpg` and `screen/after-tests.jpg`.
+- `GET /api/devices/{n}/logs?source=journal|kernel&lines=N`: live from the Mac.
+- `lab shell <device>`: an interactive shell over the out-of-band USB-C serial link (`GET/POST
+  /api/devices/{n}/console`). It works with the Mac's network down. `lab-agent setup` enables an
+  115200 getty on `ttySAC0`.
+
+Before the display driver loads, the screen can't be captured, but serial carries the text of every
+stage: m1n1, U-Boot, the kernel from `[0.000000]` (lab boots add `console=ttySAC0,115200`), and
+login. A Mac leaves serial mode on every reboot, so labd asks oobd to re-arm around each one.
+
+## Build from a GitHub URL
+
+```sh
+lab run m1air --kernel https://github.com/iconidentify/aurora-linux/tree/custom/sep --gui-test gui-smoke
+lab build https://github.com/AsahiLinux/linux/pull/123 --device m1air
+```
+
+Agents do the same with `lab_run(source=...)`, `lab_build` and `lab_build_status`, and use `lab_exec`
+instead of ssh. labd resolves repo, branch (`/tree/...`), commit and PR URLs (or `git-url#ref`) to
+a commit with `git ls-remote`. It keys the build on that commit, the target Mac's running
+`/proc/config.gz` and the kbuild recipe, and reuses an identical earlier build.
+
+`lab-builder` runs on the controller Mac as a root LaunchDaemon. Root is needed because macOS Local
+Network privacy blocks user processes. It runs `builder/kbuild` in an Apple `container` micro-VM
+(`builder/Containerfile`: Debian, gcc, Rust 1.93.1, bindgen), started in the user's session. All
+state is one size-capped volume (`container volume create -s 40G maclab-cache`): one shared
+depth-1 git store, one reused worktree, at most two build dirs, and an 8 GB ccache. The host scratch
+dir is emptied after every build. labd's artifact store is garbage-collected to a budget
+(`--artifact-budget-gb`, default 20).
+
+Measured on a base M5 (10 cores, VM with 16 GB) with aurora's config: first build 9 minutes;
+rebuild of a warm tree about 40 seconds. Progress (stage, object count, ETA) and the log stream
+live on `/api/stream` (`build`, `buildlog`) and `/api/builds/{id}/log?follow=1`.
+
+## Release packages from a PKGBUILD
+
+```sh
+lab package ~/recipes/linux-aurora                        # the recipe exactly as written
+lab package ~/recipes/linux-aurora --pkgrel 11.14 \
+    --commit https://github.com/iconidentify/aurora-linux/commit/<sha> -o ./rel
+lab run m1air --kernel <build-id>                         # boot the kernel package once
+lab build-get <build-id> -o ./rel                         # packages + the PKGBUILD as built, sha256-checked
+```
+
+A kernel build (above) makes a lab test artifact. A package build makes the release: it runs a
+PKGBUILD recipe with `makepkg`, the way the release machine (m1) does, and returns every package it
+makes (`linux-aurora`, `linux-aurora-headers`, ...) plus the PKGBUILD as built. The CLI uploads only
+the recipe's own files: the PKGBUILD, its local sources, and install/changelog files. makepkg
+downloads the rest. `--commit` repoints `_commit` (the PKGBUILD must download from that repository),
+`--pkgrel` sets pkgrel, and either one refreshes the checksums with `updpkgsums`. Agents use
+`lab_package`, then `lab_build_status`, then `lab_run(build_id=...)`.
+
+The builder is `builder/pkg`. It is Arch Linux ARM, the release machine's `/etc/makepkg.conf`
+verbatim, and `maclab.conf` with the one difference: packages are `.pkg.tar.zst`. ccache stays
+off, as on the release machine: its base-dir path rewriting changes `__FILE__` strings inside
+modules. When the image is built, gcc, glibc, binutils, rustup, bindgen and pahole come out at the
+same versions as on an up-to-date Arch Linux ARM machine. Rebuild the image to follow the distribution:
+
+```sh
+# on the controller Mac, in a directory holding builder/pkg/* and the rootfs tarball
+curl -LO http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz
+container build -t maclab-pkgbuild:1 .
+container volume create -s 120G maclab-pkgcache   # once; a kernel tree needs ~35 GB while building
+```
+
+Checked against a linux-aurora build of the same recipe on an Arch Linux ARM machine: the file
+lists and package metadata are identical. Contents are byte-identical except where the build
+directory's path leaks in: ELF build-ids, the source paths Rust drivers embed for panics
+(`/cache/work/b/...` here), and the build timestamp in `vmlinuz`. A cold build takes 8 to 12
+minutes on a base M5.
+
+The 30+ GB work tree is deleted after every build. The volume keeps downloaded sources (the newest
+six) and the Rust toolchains. `lab-builder` takes package builds only when it has
+`--pkg-image` (the default, `maclab-pkgbuild:1`). An older builder only ever gets kernel builds.
+
+## Kernel artifacts
+
+A tarball in the Arch package layout: exactly one
+`usr/lib/modules/<release>/` holding the modules and `vmlinuz` (or `Image`).
+A `linux-*.pkg.tar.zst` works as-is. From an `O=` build tree:
+
+```sh
+lab pack --build ~/linux/build    # the O= dir -> kernel-<release>.tar.zst
+```
+
+The release string must be unique (set `LOCALVERSION`). The agent refuses to
+install over a kernel it didn't install, including the running one.
+
+The device tree comes from m1n1 on the ESP, not from the test kernel, and that includes a
+release package booted with `lab run`. A kernel that needs new DT bindings needs a matching
+m1n1 stage 2. A lab boot doesn't exercise device-tree changes.
+
+## For AI agents
+
+```sh
+claude mcp add maclab -- lab mcp
+```
+
+Tools: `lab_devices`, `lab_device`, `lab_run`, `lab_wait`, `lab_job`, `lab_jobs`,
+`lab_log`, `lab_screenshot`, `lab_baseline`, `lab_crashtest`, `lab_lease`,
+`lab_release`, `lab_reset`, `lab_serial`, `lab_exec`, `lab_cancel`, `lab_build`,
+`lab_build_status` and `lab_package`. A device in `needs_hands` is waiting for a
+person. Tell the user; don't retry.
+
+A lab is worth describing to its agents once: which Macs you have, which one has
+serial, what they must not touch. Write that in a short Markdown file and hand it
+to them with a prompt.
+
+## Not yet verified on hardware
+
+- `macvdmtool` driving the target from an M3 host. (It is verified from an **M5 Pro** host, J704AP, on macOS 26.5.)
+- Whether `apple_wdt` can be armed before the kernel starts (m1n1/U-Boot).
+  If it can, tier 1 would also cover early-boot hangs.
+
+## Development
+
+`make test` runs the unit tests and eight end-to-end scenarios against a
+simulated Mac (`internal/agent/sim.go`):
+
+- A good kernel
+- Panic at boot
+- Hang, recovered by hard reset
+- Silent hang, caught from serial
+- No OOB, human power cycle, then queued jobs resume
+- Crash during a test
+- Deliberate crash test
+- A failing test
+
+`lab-agent sim --server .. --token ..` enrolls a simulated Mac against a real labd.
+
+## Phones and the LAN
+
+`labd --trust 192.168.1.0/24,127.0.0.1` (or `MACLAB_TRUST`) lets browsers on
+those networks use the UI with no admin token, so a phone can just open
+`http://<labd-host>:7770`. It judges the TCP peer address only, never a
+forwarded header. Everyone on a trusted network can reboot Macs, open
+their serial shell and run commands on them as root, so trust only a
+network you'd hand a root shell to. A token still works from anywhere. On a
+phone the UI switches to a bottom tab bar and can be added to the home
+screen.
+
+## License
+
+MIT; see [LICENSE](LICENSE). The web UI bundles third-party files under their own
+licenses: xterm.js (MIT), subsets of JetBrains Mono Nerd Font and IBM Plex Sans
+(SIL OFL 1.1), and the Omarchy logo, icon and font (MIT). See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). maclab isn't an official Omarchy
+or Asahi Linux project, and it isn't affiliated with Apple.

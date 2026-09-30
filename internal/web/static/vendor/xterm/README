@@ -1,0 +1,2 @@
+xterm.js 6.0.0 and @xterm/addon-fit 0.11.0 from npm, unmodified. MIT, see LICENSE.
+Vendored because the lab has no CDN access; loaded only when the Live shell opens.

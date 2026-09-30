@@ -1,0 +1,86 @@
+#!/bin/bash
+# pkgbuild: build the packages of one PKGBUILD recipe with makepkg.
+#
+# In:  /io/recipe.tar (a recipe directory: PKGBUILD plus its local sources)
+#      optional env SRC_REPO + SRC_SHA (point the recipe's _commit at this commit)
+#      and PKGREL (set pkgrel); either one refreshes the source checksums.
+# Out: /io/out/*.pkg.tar.zst and the PKGBUILD as built, /io/release (kernel
+#      release of the package holding a vmlinuz, if any), /io/kernel (its file name).
+# The 30+ GB work tree is deleted after every build. /cache keeps downloaded
+# sources and the Rust toolchains. No ccache: see maclab.conf.
+set -euo pipefail
+C=/cache
+W=$C/work
+mkdir -p $C/sources $C/rustup $C/cargo
+rm -rf $C/ccache
+rm -rf "$W" /io/out
+mkdir -p "$W/recipe" "$W/out" /io/out
+step() { echo "==> $*"; echo "@@stage ${1%% *}"; }
+fail() { echo "error: $*"; exit 1; }
+rm -f /io/github-token # public source downloads only
+
+step "recipe"
+tar -C "$W/recipe" -xf /io/recipe.tar
+cd "$W/recipe"
+[ -f PKGBUILD ] || fail "the recipe has no PKGBUILD at its top level"
+if [ -n "${SRC_SHA:-}" ]; then
+  grep -q '^_commit=' PKGBUILD || fail "the PKGBUILD has no _commit= line, so it can't be pointed at a commit"
+  if [[ ${SRC_REPO:-} == https://github.com/* ]]; then
+    repo=${SRC_REPO#https://github.com/}
+    grep -qi "github.com/$repo/" PKGBUILD || fail "the PKGBUILD downloads from a different repository than $SRC_REPO"
+  fi
+  sed -i "s/^_commit=.*/_commit=$SRC_SHA/" PKGBUILD
+  echo "_commit=$SRC_SHA"
+fi
+if [ -n "${PKGREL:-}" ]; then
+  [[ $PKGREL =~ ^[0-9]+(\.[0-9]+)?$ ]] || fail "pkgrel $PKGREL is not a number like 3 or 11.14"
+  sed -i "s/^pkgrel=.*/pkgrel=$PKGREL/" PKGBUILD
+  echo "pkgrel=$PKGREL"
+fi
+
+chown -R build: "$W" $C/sources $C/rustup $C/cargo
+as_build() {
+  sudo -u build env HOME=/home/build PATH="$PATH" SRCDEST=$C/sources BUILDDIR="$W/b" PKGDEST="$W/out" \
+    RUSTUP_HOME=$C/rustup CARGO_HOME=$C/cargo "$@"
+}
+if [ -n "${SRC_SHA:-}${PKGREL:-}" ]; then
+  step "checksums"
+  as_build updpkgsums
+fi
+echo "toolchain: $(gcc --version | head -1); $(pacman -Q rustup rust-bindgen pahole binutils | tr '\n' ' ')"
+
+step "build ($(nproc) cpus)"
+start=$(date +%s)
+total=$(cat $C/.objcount 2>/dev/null || echo 0)
+( while sleep 5; do echo "@@progress $(find "$W/b" -name '*.o' 2>/dev/null | wc -l) $total"; done ) &
+ticker=$!
+trap 'kill $ticker 2>/dev/null || true' EXIT
+# The log keeps makepkg's own lines and every diagnostic; kbuild's one line per
+# object ("  CC  foo.o") and strip -v chatter are dropped, as kernel builds' -s does.
+set +e
+as_build makepkg -sf --noconfirm --nocheck 2>&1 | grep --line-buffered -vE '^  [A-Z][A-Z0-9_]*( \[M\])? +[^ ]|^copy from |^Removing '
+st=${PIPESTATUS[0]}
+set -e
+[ "$st" -eq 0 ] || fail "makepkg failed"
+kill $ticker 2>/dev/null || true
+n=$(find "$W/b" -name '*.o' | wc -l); [ "$n" -gt 0 ] && echo "$n" > $C/.objcount
+echo "@@progress $n $n"
+echo "build: $(( $(date +%s) - start ))s"
+cp "$W"/out/*.pkg.tar.zst PKGBUILD /io/out/ 2>/dev/null || fail "makepkg made no packages"
+
+step "package"
+for f in /io/out/*.pkg.tar.zst; do
+  krel=$(tar -tf "$f" | sed -n 's|^usr/lib/modules/\([^/]*\)/vmlinuz$|\1|p' | head -1)
+  if [ -n "$krel" ] && [ ! -s /io/kernel ]; then
+    echo "$krel" > /io/release
+    basename "$f" > /io/kernel
+  fi
+  echo "$(basename "$f") $(du -h "$f" | cut -f1)${krel:+ (kernel $krel)}"
+done
+ls /io/out/*.pkg.tar.zst >/dev/null 2>&1 || fail "makepkg made no packages"
+
+step "tidy cache"
+rm -rf "$W"
+ls -1t $C/sources/* 2>/dev/null | tail -n +7 | xargs -r rm -rf
+df -h $C | tail -1
+exit 0

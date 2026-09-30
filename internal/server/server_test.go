@@ -1,0 +1,648 @@
+package server
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"log"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/iconidentify/maclab/internal/agent"
+	"github.com/iconidentify/maclab/internal/api"
+	"github.com/iconidentify/maclab/internal/oob"
+)
+
+// fakeOOB is a Central-Scrutinizer-shaped controller wired to a simulated Mac.
+type fakeOOB struct {
+	sim    *agent.Sim
+	lines  chan string
+	resets int
+	mu     sync.Mutex
+}
+
+func (f *fakeOOB) Name() string { return "fake-oob" }
+func (f *fakeOOB) Reset(ctx context.Context) error {
+	f.mu.Lock()
+	f.resets++
+	f.mu.Unlock()
+	f.sim.PowerCycle()
+	return nil
+}
+func (f *fakeOOB) Raw(ctx context.Context, w io.Writer) error     { <-ctx.Done(); return nil }
+func (f *fakeOOB) Write(ctx context.Context, b []byte) error      { return nil }
+func (f *fakeOOB) Arm(ctx context.Context, d time.Duration) error { return nil }
+func (f *fakeOOB) Status(ctx context.Context) (string, error)     { return "Connection: Sink", nil }
+func (f *fakeOOB) Serial(ctx context.Context, fn func(string)) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case l := <-f.lines:
+			fn(l)
+		}
+	}
+}
+
+type lab struct {
+	t      *testing.T
+	s      *Server
+	sim    *agent.Sim
+	oob    *fakeOOB
+	notes  []Notification
+	mu     sync.Mutex
+	cancel context.CancelFunc
+	url    string
+}
+
+func newLab(t *testing.T, withOOB bool) *lab {
+	aliveWindow = 1500 * time.Millisecond
+	panicGrace = 2 * time.Second
+	serialStall = 3 * time.Second
+	quietGrace = 3 * time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	l := &lab{t: t, cancel: cancel}
+	sim := agent.NewSim(t.TempDir())
+	sim.RebootDelay = 300 * time.Millisecond
+	l.sim = sim
+	l.oob = &fakeOOB{sim: sim, lines: make(chan string, 1000)}
+	sim.Serial = func(line string) {
+		select {
+		case l.oob.lines <- line:
+		default:
+		}
+	}
+	quiet := log.New(io.Discard, "", 0)
+	if os.Getenv("MACLAB_TEST_LOG") != "" {
+		quiet = log.New(os.Stderr, "labd: ", log.Ltime|log.Lmicroseconds)
+	}
+	s, err := New(ctx, Config{DataDir: t.TempDir(), AdminToken: "admin", Interval: 200 * time.Millisecond,
+		BootTimeout: 4 * time.Second, OfflineAfter: time.Hour, BuilderToken: "bld",
+		OOBFactory: func(*api.Device) (oob.Controller, error) { return l.oob, nil }}, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.s = s
+	s.OnNotify(func(n Notification) { l.mu.Lock(); l.notes = append(l.notes, n); l.mu.Unlock() })
+	hs := httptest.NewServer(s.Handler())
+	l.url = hs.URL
+	t.Cleanup(func() { cancel(); hs.Close() })
+
+	// Enroll the simulated Mac exactly as lab-agent setup would.
+	tok, _ := s.store.addTokenForTest("sim-mac")
+	resp, err := agent.Enroll(ctx, hs.URL, tok, sim.Facts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agent.New(&agent.Config{Server: hs.URL, DeviceID: resp.DeviceID, Name: resp.Name, Secret: resp.Secret, WorkDir: t.TempDir()}, sim, quiet)
+	go a.Run(ctx)
+	if withOOB {
+		v := s.dev("sim-mac")
+		v.mu.Lock()
+		v.d.OOB = &api.OOBConfig{Driver: "fake"}
+		v.mu.Unlock()
+		s.attachOOB(v)
+	}
+	return l
+}
+
+func (st *store) addTokenForTest(name string) (string, error) {
+	tok := "enr_test_" + name
+	return tok, st.addToken(hashSecret(tok), api.EnrollTokenRequest{Name: name, Model: api.ModelLaptop}, time.Now().Add(time.Hour))
+}
+
+func (l *lab) artifact(content string) string {
+	l.t.Helper()
+	sha, err := putArtifactForTest(l.s, content)
+	if err != nil {
+		l.t.Fatal(err)
+	}
+	return sha
+}
+
+func putArtifactForTest(s *Server, content string) (string, error) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/artifacts", strings.NewReader(content))
+	s.hPutArtifact(rec, req)
+	var sha string
+	body := rec.Body.String()
+	if i := strings.Index(body, `"sha256":"`); i >= 0 {
+		sha = body[i+10 : i+74]
+	}
+	return sha, nil
+}
+
+func (l *lab) run(spec api.JobSpec) *api.Job {
+	l.t.Helper()
+	spec.Device = "sim-mac"
+	j, _, err := l.s.Submit(spec)
+	if err != nil {
+		l.t.Fatal(err)
+	}
+	return l.wait(j.ID, 60*time.Second)
+}
+
+func (l *lab) wait(id string, d time.Duration) *api.Job {
+	l.t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		j, err := l.s.store.job(id)
+		if err == nil && j.State == api.JobDone {
+			return j
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	j, _ := l.s.store.job(id)
+	l.t.Fatalf("job %s did not finish: state %s events %v", id, j.State, j.Events)
+	return nil
+}
+
+func (l *lab) baseline() {
+	l.t.Helper()
+	l.waitDevice(func(d api.Device) bool { return d.BootID != "" })
+	j := l.run(api.JobSpec{Baseline: true})
+	if j.Outcome != api.OutcomePass {
+		l.t.Fatalf("baseline: %s: %s\n%v", j.Outcome, j.Summary, j.Events)
+	}
+	l.waitDevice(func(d api.Device) bool { return d.State == api.StateReady })
+}
+
+func (l *lab) waitDevice(cond func(api.Device) bool) api.Device {
+	l.t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		d := l.s.dev("sim-mac").snapshot()
+		if cond(d) {
+			return d
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	d := l.s.dev("sim-mac").snapshot()
+	l.t.Fatalf("device condition not met: state=%s reason=%s kernel=%s", d.State, d.StateReason, d.Kernel)
+	return d
+}
+
+func (l *lab) expect(j *api.Job, outcome string) {
+	l.t.Helper()
+	if j.Outcome != outcome {
+		var ev []string
+		for _, e := range j.Events {
+			ev = append(ev, e.Msg)
+		}
+		l.t.Fatalf("outcome %s (%s), want %s\nevents:\n  %s", j.Outcome, j.Summary, outcome, strings.Join(ev, "\n  "))
+	}
+}
+
+func TestBaselineAndGoodKernel(t *testing.T) {
+	l := newLab(t, true)
+	if _, _, err := l.s.Submit(api.JobSpec{Device: "sim-mac", Kernel: l.artifact("krel=x")}); err == nil {
+		t.Fatal("job accepted before baseline")
+	}
+	l.baseline()
+	j := l.run(api.JobSpec{Kernel: l.artifact("krel=7.2-rc1 behavior=ok"), Tests: []api.TestSpec{{Name: "gui-smoke", Builtin: "gui-smoke"}}})
+	l.expect(j, api.OutcomePass)
+	if !j.Result.Booted || j.Result.BootKernel != "7.2-rc1" || len(j.Result.Tests) != 2 {
+		t.Fatalf("result: %+v", j.Result)
+	}
+	if len(j.Result.NewErrorLines) != 1 || !strings.Contains(j.Result.NewErrorLines[0], "regression") {
+		t.Fatalf("baseline diff: %v", j.Result.NewErrorLines)
+	}
+	d := l.waitDevice(func(d api.Device) bool { return d.State == api.StateReady })
+	if d.Kernel != agent.SimKnownGood || d.Health.JobTag != "" {
+		t.Fatalf("not restored: kernel %s tag %q", d.Kernel, d.Health.JobTag)
+	}
+}
+
+func TestPanicAtBootFallsBack(t *testing.T) {
+	l := newLab(t, true)
+	l.baseline()
+	j := l.run(api.JobSpec{Kernel: l.artifact("krel=7.2-bad behavior=panic")})
+	l.expect(j, api.OutcomePanicked)
+	if !j.Result.FellBack || l.oob.resets != 0 {
+		t.Fatalf("fellback=%v resets=%d", j.Result.FellBack, l.oob.resets)
+	}
+	if !strings.Contains(j.Summary, "VFS: Unable to mount root fs") {
+		t.Fatalf("summary lacks the panic line: %s", j.Summary)
+	}
+	l.waitDevice(func(d api.Device) bool { return d.State == api.StateReady })
+}
+
+func TestHangRecoveredByHardReset(t *testing.T) {
+	l := newLab(t, true)
+	l.baseline()
+	j := l.run(api.JobSpec{Kernel: l.artifact("krel=7.2-hang behavior=hang")})
+	l.expect(j, api.OutcomeHung)
+	if l.oob.resets == 0 {
+		t.Fatal("expected a hard reset")
+	}
+	if !strings.Contains(j.Summary, "rcu_sched") {
+		t.Fatalf("summary: %s", j.Summary)
+	}
+	l.waitDevice(func(d api.Device) bool { return d.State == api.StateReady && d.Kernel == agent.SimKnownGood })
+}
+
+func TestSilentHangDetectedFromSerial(t *testing.T) {
+	l := newLab(t, true)
+	l.baseline()
+	start := time.Now()
+	j := l.run(api.JobSpec{Kernel: l.artifact("krel=7.2-silent behavior=silent"), BootTimeoutSec: 30})
+	l.expect(j, api.OutcomeHung)
+	if time.Since(start) > 20*time.Second {
+		t.Fatalf("took %s: serial stall should beat the 30s boot timeout", time.Since(start))
+	}
+	if !strings.Contains(strings.Join(j.Result.Recovery, "|"), "serial console silent") {
+		t.Fatalf("recovery: %v", j.Result.Recovery)
+	}
+}
+
+func TestNoOOBAsksHumanThenResumes(t *testing.T) {
+	l := newLab(t, false)
+	l.baseline()
+	j := l.run(api.JobSpec{Kernel: l.artifact("krel=7.2-hang behavior=hang")})
+	l.expect(j, api.OutcomeHung)
+	d := l.waitDevice(func(d api.Device) bool { return d.State == api.StateNeedsHands })
+	if d.Action == nil || !strings.Contains(d.Action.Text(), "Hold the power button") {
+		t.Fatalf("action: %+v", d.Action)
+	}
+	l.mu.Lock()
+	var urgent int
+	for _, n := range l.notes {
+		if n.Priority == "urgent" {
+			urgent++
+		}
+	}
+	l.mu.Unlock()
+	if urgent != 1 {
+		t.Fatalf("urgent notifications: %d", urgent)
+	}
+
+	// A job queued now waits for the human.
+	next, _, err := l.s.Submit(api.JobSpec{Device: "sim-mac", Kernel: l.artifact("krel=7.2-ok behavior=ok")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Second)
+	if j, _ := l.s.store.job(next.ID); j.State != api.JobQueued {
+		t.Fatalf("job started while the Mac needed hands: %s", j.State)
+	}
+	l.sim.PowerCycle() // the human
+	l.expect(l.wait(next.ID, 60*time.Second), api.OutcomePass)
+}
+
+func TestCrashDuringTest(t *testing.T) {
+	l := newLab(t, true)
+	l.baseline()
+	j := l.run(api.JobSpec{Kernel: l.artifact("krel=7.2-oops behavior=crash-in-test")})
+	l.expect(j, api.OutcomePanicked)
+	if !strings.Contains(j.Summary, "during test boot-health") {
+		t.Fatalf("summary: %s", j.Summary)
+	}
+	l.waitDevice(func(d api.Device) bool { return d.State == api.StateReady && d.Kernel == agent.SimKnownGood })
+}
+
+func TestCrashTestSelfRecovers(t *testing.T) {
+	l := newLab(t, true)
+	l.baseline()
+	j := l.run(api.JobSpec{Crash: "panic"})
+	l.expect(j, api.OutcomePass)
+	if !strings.Contains(j.Summary, "recovered by itself") {
+		t.Fatalf("summary: %s", j.Summary)
+	}
+}
+
+func TestFailingTest(t *testing.T) {
+	l := newLab(t, true)
+	l.baseline()
+	j := l.run(api.JobSpec{Kernel: l.artifact("krel=7.2-ok behavior=ok"), Tests: []api.TestSpec{{Name: "will-fail", Builtin: "x"}}})
+	l.expect(j, api.OutcomeTestsFailed)
+}
+
+func (l *lab) get(method, path string) (*http.Response, string) {
+	l.t.Helper()
+	req, _ := http.NewRequest(method, l.url+path, nil)
+	req.Header.Set("Authorization", "Bearer admin")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		l.t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	return resp, string(b)
+}
+
+func TestLiveStreamScreenAndLogs(t *testing.T) {
+	l := newLab(t, true)
+	l.baseline()
+
+	// The stream carries job, device and serial events while a job runs.
+	req, _ := http.NewRequest("GET", l.url+"/api/stream", nil)
+	req.Header.Set("Authorization", "Bearer admin")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	kinds := make(chan string, 1000)
+	go func() {
+		sc := bufio.NewScanner(resp.Body)
+		for sc.Scan() {
+			if k, ok := strings.CutPrefix(sc.Text(), "event: "); ok {
+				kinds <- k
+			}
+		}
+	}()
+	j := l.run(api.JobSpec{Kernel: l.artifact("krel=7.2-live behavior=ok")})
+	l.expect(j, api.OutcomePass)
+	seen := map[string]bool{}
+	for len(kinds) > 0 {
+		seen[<-kinds] = true
+	}
+	for _, k := range []string{"job", "device", "serial", "screen"} {
+		if !seen[k] {
+			t.Errorf("stream never sent a %q event (saw %v)", k, seen)
+		}
+	}
+	// Jobs capture the screen after boot and after tests.
+	var shots int
+	for _, f := range j.Result.Logs {
+		if strings.HasPrefix(f, "screen/") {
+			shots++
+		}
+	}
+	if shots != 2 {
+		t.Errorf("job screenshots: %v", j.Result.Logs)
+	}
+
+	// Capture now, then fetch the latest image.
+	if r, body := l.get("POST", "/api/devices/sim-mac/screenshot"); r.StatusCode != 200 {
+		t.Fatalf("screenshot: %s %s", r.Status, body)
+	}
+	r, body := l.get("GET", "/api/devices/sim-mac/screen")
+	if r.StatusCode != 200 || r.Header.Get("Content-Type") != "image/jpeg" || len(body) < 1000 {
+		t.Fatalf("screen: %s %s %d bytes", r.Status, r.Header.Get("Content-Type"), len(body))
+	}
+	if r, body := l.get("GET", "/api/devices/sim-mac/logs?source=kernel&lines=10"); r.StatusCode != 200 || !strings.Contains(body, "sim kernel") {
+		t.Fatalf("logs: %s %q", r.Status, body)
+	}
+}
+
+func TestScreenAtRestoredOnStart(t *testing.T) {
+	dir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	quiet := log.New(io.Discard, "", 0)
+	s, err := New(ctx, Config{DataDir: dir, AdminToken: "a"}, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := api.Device{ID: "d1", Name: "mac", State: api.StateReady}
+	s.store.saveDevice(&d, "h")
+	os.MkdirAll(s.screenDir("mac"), 0o755)
+	os.WriteFile(filepath.Join(s.screenDir("mac"), "1790753481823.jpg"), []byte("x"), 0o644)
+	s2, err := New(ctx, Config{DataDir: dir, AdminToken: "a"}, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s2.view(s2.dev("mac")).ScreenAt; got.UnixMilli() != 1790753481823 {
+		t.Fatalf("screen_at %v", got)
+	}
+}
+
+// fakeBuilder plays lab-builder: it takes builds and "builds" a sim kernel.
+func (l *lab) fakeBuilder(ctx context.Context, builds *int) {
+	post := func(path string, body io.Reader, out any) int {
+		req, _ := http.NewRequestWithContext(ctx, "POST", l.url+path, body)
+		req.Header.Set("Authorization", "Bearer bld")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return 0
+		}
+		defer resp.Body.Close()
+		if out != nil {
+			json.NewDecoder(resp.Body).Decode(out)
+		}
+		return resp.StatusCode
+	}
+	for ctx.Err() == nil {
+		var a api.BuildAssignment
+		if post("/api/builder/poll?host=fake", nil, &a) != 200 {
+			continue
+		}
+		*builds++
+		lines := `{"lines":["==> fetch","@@stage fetch","@@stage build","@@progress 50 100","CC some/file.o warning: x","@@progress 100 100"]}`
+		post("/api/builder/builds/"+a.Build.ID+"/progress", strings.NewReader(lines), nil)
+		var up struct{ SHA256 string }
+		post("/api/builder/artifacts", strings.NewReader("krel=7.2-src"+a.LabVer+" behavior=ok"), &up)
+		done, _ := json.Marshal(api.BuildResult{Release: "7.2-src" + a.LabVer, Artifact: up.SHA256, Seconds: 1})
+		post("/api/builder/builds/"+a.Build.ID+"/done", bytes.NewReader(done), nil)
+	}
+}
+
+func gitRepo(t *testing.T) string {
+	dir := t.TempDir()
+	run := func(args ...string) {
+		c := exec.Command("git", args...)
+		c.Dir = dir
+		c.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+	}
+	run("init", "-q", "-b", "main")
+	os.WriteFile(filepath.Join(dir, "Makefile"), []byte("all:\n"), 0o644)
+	run("add", ".")
+	run("commit", "-q", "-m", "x")
+	return "file://" + dir + "@main"
+}
+
+func TestSourceBuildJobAndReuse(t *testing.T) {
+	l := newLab(t, true)
+	l.baseline()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	builds := 0
+	go l.fakeBuilder(ctx, &builds)
+
+	src := gitRepo(t)
+	j := l.run(api.JobSpec{Source: src})
+	l.expect(j, api.OutcomePass)
+	if !strings.HasPrefix(j.Result.BootKernel, "7.2-src-lab") || j.Spec.Build == "" {
+		t.Fatalf("booted %q build %q", j.Result.BootKernel, j.Spec.Build)
+	}
+	var hasLog bool
+	for _, f := range j.Result.Logs {
+		hasLog = hasLog || f == "build.log"
+	}
+	b, err := l.s.getBuild(j.Spec.Build)
+	if err != nil || !hasLog || b.State != api.BuildDone || b.LogLines != 2 || b.Progress != 1 {
+		t.Fatalf("build %+v log=%v err=%v", b, hasLog, err)
+	}
+	if r, body := l.get("GET", "/api/builds/"+b.ID+"/log"); r.StatusCode != 200 || !strings.Contains(body, "warning: x") || strings.Contains(body, "@@") {
+		t.Fatalf("log: %s %q", r.Status, body)
+	}
+
+	// Same source again: no second build.
+	j2 := l.run(api.JobSpec{Source: src})
+	l.expect(j2, api.OutcomePass)
+	if builds != 1 || j2.Spec.Build != b.ID {
+		t.Fatalf("builds=%d reused=%s want %s", builds, j2.Spec.Build, b.ID)
+	}
+	var reused bool
+	for _, e := range j2.Events {
+		reused = reused || strings.HasPrefix(e.Msg, "reusing ")
+	}
+	if !reused {
+		t.Fatal("second job did not say it reused the build")
+	}
+}
+
+func TestBuildFailureFailsJob(t *testing.T) {
+	l := newLab(t, true)
+	l.baseline()
+	j := l.run(api.JobSpec{Source: "file:///nonexistent/repo.git@main"})
+	l.expect(j, api.OutcomeBuildFailed)
+
+	// A build that starts and fails still links the job to its build and log.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		for ctx.Err() == nil {
+			req, _ := http.NewRequestWithContext(ctx, "POST", l.url+"/api/builder/poll?host=x", nil)
+			req.Header.Set("Authorization", "Bearer bld")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil || resp.StatusCode != 200 {
+				continue
+			}
+			var a api.BuildAssignment
+			json.NewDecoder(resp.Body).Decode(&a)
+			resp.Body.Close()
+			done, _ := json.Marshal(api.BuildResult{Error: "compile error"})
+			r2, _ := http.NewRequest("POST", l.url+"/api/builder/builds/"+a.Build.ID+"/done", bytes.NewReader(done))
+			r2.Header.Set("Authorization", "Bearer bld")
+			http.DefaultClient.Do(r2)
+		}
+	}()
+	j = l.run(api.JobSpec{Source: gitRepo(t)})
+	l.expect(j, api.OutcomeBuildFailed)
+	if j.Spec.Build == "" {
+		t.Fatal("failed build job has no spec.build")
+	}
+}
+
+func TestPackageBuild(t *testing.T) {
+	l := newLab(t, true)
+	l.baseline()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	recipe := l.artifact("PKGBUILD tarball")
+	b, err := l.s.EnsureBuild(ctx, api.BuildRequest{Recipe: recipe, RecipeDir: "/r/linux-aurora", Pkgrel: "11.14"})
+	if err != nil || b.Kind != api.BuildPackage || b.State != api.BuildQueued {
+		t.Fatalf("queue: %+v %v", b, err)
+	}
+	if _, err := l.s.EnsureBuild(ctx, api.BuildRequest{Recipe: recipe, Pkgrel: "eleven"}); err == nil {
+		t.Fatal("a bad pkgrel was accepted")
+	}
+
+	poll := func(kinds string, wait time.Duration) (api.BuildAssignment, int) {
+		pctx, done := context.WithTimeout(ctx, wait)
+		defer done()
+		req, _ := http.NewRequestWithContext(pctx, "POST", l.url+"/api/builder/poll?host=x&kinds="+kinds, nil)
+		req.Header.Set("Authorization", "Bearer bld")
+		var a api.BuildAssignment
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return a, 0
+		}
+		defer resp.Body.Close()
+		json.NewDecoder(resp.Body).Decode(&a)
+		return a, resp.StatusCode
+	}
+	// A builder that only knows kernel builds must not get it.
+	if a, code := poll("", 1500*time.Millisecond); code == 200 {
+		t.Fatalf("kernel-only builder got %+v", a.Build)
+	}
+	a, code := poll("kernel,package", 5*time.Second)
+	if code != 200 || a.Build.ID != b.ID || a.Build.Pkgrel != "11.14" || a.LabVer != "" {
+		t.Fatalf("package builder got %d %+v labver %q", code, a.Build, a.LabVer)
+	}
+	upload := func(content string) string {
+		req, _ := http.NewRequest("POST", l.url+"/api/builder/artifacts", strings.NewReader(content))
+		req.Header.Set("Authorization", "Bearer bld")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var up struct{ SHA256 string }
+		json.NewDecoder(resp.Body).Decode(&up)
+		return up.SHA256
+	}
+	kpkg := upload("krel=7.1.12-2-11.14-sep-ARCH behavior=ok")
+	hpkg := upload("headers")
+	files := []api.BuildFile{{Name: "linux-aurora-7.1.12.aurora2-11.14-aarch64.pkg.tar.zst", SHA256: kpkg, Size: 41},
+		{Name: "linux-aurora-headers-7.1.12.aurora2-11.14-aarch64.pkg.tar.zst", SHA256: hpkg, Size: 7}}
+	done, _ := json.Marshal(api.BuildResult{Release: "7.1.12-2-11.14-sep-ARCH", Artifact: kpkg, Files: files, Seconds: 900})
+	req, _ := http.NewRequest("POST", l.url+"/api/builder/builds/"+b.ID+"/done", bytes.NewReader(done))
+	req.Header.Set("Authorization", "Bearer bld")
+	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != 204 {
+		t.Fatalf("done: %v %v", resp, err)
+	}
+	b, _ = l.s.getBuild(b.ID)
+	if b.State != api.BuildDone || len(b.Files) != 2 || b.Artifact != kpkg {
+		t.Fatalf("finished build %+v", b)
+	}
+	if r, body := l.get("GET", "/api/builds/"+b.ID+"/files/"+files[1].Name); r.StatusCode != 200 || body != "headers" ||
+		!strings.Contains(r.Header.Get("Content-Disposition"), files[1].Name) {
+		t.Fatalf("file: %s %q", r.Status, body)
+	}
+	if r, _ := l.get("GET", "/api/builds/"+b.ID+"/files/..%2Fetc%2Fpasswd"); r.StatusCode != 404 {
+		t.Fatalf("unknown file: %s", r.Status)
+	}
+	// The same recipe and pkgrel again is the same build.
+	if again, err := l.s.EnsureBuild(ctx, api.BuildRequest{Recipe: recipe, Pkgrel: "11.14"}); err != nil || again.ID != b.ID {
+		t.Fatalf("not reused: %+v %v", again, err)
+	}
+	// And the kernel package boots once like any kernel artifact.
+	j := l.run(api.JobSpec{Kernel: b.Artifact})
+	l.expect(j, api.OutcomePass)
+	if j.Result.BootKernel != "7.1.12-2-11.14-sep-ARCH" {
+		t.Fatalf("booted %q", j.Result.BootKernel)
+	}
+}
+
+func TestSuspendDuringTestIsNotACrash(t *testing.T) {
+	l := newLab(t, true)
+	l.baseline()
+	l.sim.SuspendFor = 6 * time.Second // well past quietGrace: only the announcement keeps it waiting
+	j := l.run(api.JobSpec{Kernel: l.artifact("krel=7.2-ok behavior=ok"),
+		Tests: []api.TestSpec{{Name: "suspend-then-resume", Builtin: "x"}, {Name: "after-resume", Builtin: "x"}}})
+	l.expect(j, api.OutcomePass)
+	var slept, back bool
+	for _, e := range j.Events {
+		slept = slept || strings.Contains(e.Msg, "went to sleep")
+		back = back || strings.Contains(e.Msg, "back on the same boot")
+	}
+	if !slept || !back || len(j.Result.Recovery) != 0 || len(j.Result.Tests) != 3 {
+		t.Fatalf("slept=%v back=%v recovery=%v tests=%+v", slept, back, j.Result.Recovery, j.Result.Tests)
+	}
+}
+
+func TestShortQuietSpellDuringTest(t *testing.T) {
+	l := newLab(t, true)
+	l.baseline()
+	l.sim.SuspendFor = 2 * time.Second // past aliveWindow, within quietGrace, never announced
+	j := l.run(api.JobSpec{Kernel: l.artifact("krel=7.2-ok behavior=ok"), Tests: []api.TestSpec{{Name: "quiet-suspend-wifi-drop", Builtin: "x"}}})
+	l.expect(j, api.OutcomePass)
+	if len(j.Result.Recovery) != 0 {
+		t.Fatalf("recovery %v", j.Result.Recovery)
+	}
+}

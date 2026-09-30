@@ -1,0 +1,460 @@
+// Package api holds the wire types shared by labd, lab-agent, oobd and the lab CLI.
+package api
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+)
+
+// DeviceState is where a device sits in the lab's lifecycle.
+type DeviceState string
+
+const (
+	StateNew        DeviceState = "new"         // enrolled, baseline not yet passed
+	StateReady      DeviceState = "ready"       // idle, in the pool
+	StateBusy       DeviceState = "busy"        // running a job
+	StateRecovering DeviceState = "recovering"  // walking the recovery ladder
+	StateNeedsHands DeviceState = "needs_hands" // waiting for a human power cycle
+	StateOffline    DeviceState = "offline"     // idle and not heartbeating
+)
+
+// Model decides which human instructions a device gets.
+const (
+	ModelLaptop  = "laptop"
+	ModelDesktop = "desktop"
+)
+
+// OOBConfig points labd at the controller that can reset a device and read its serial console.
+type OOBConfig struct {
+	Driver string `json:"driver"` // "oobd"
+	URL    string `json:"url"`
+	Token  string `json:"token,omitempty"`
+}
+
+type Lease struct {
+	Holder  string    `json:"holder"`
+	Expires time.Time `json:"expires"`
+}
+
+// HumanAction is the one instruction a person needs when the lab cannot recover a device itself.
+type HumanAction struct {
+	Title   string    `json:"title"`
+	Steps   []string  `json:"steps"`
+	Why     string    `json:"why"`
+	LastLog string    `json:"last_log,omitempty"`
+	Since   time.Time `json:"since"`
+}
+
+type Device struct {
+	ID          string       `json:"id"`
+	Name        string       `json:"name"`
+	Label       string       `json:"label"` // physical description for humans
+	Model       string       `json:"model"`
+	OOB         *OOBConfig   `json:"oob,omitempty"`
+	State       DeviceState  `json:"state"`
+	StateReason string       `json:"state_reason,omitempty"`
+	Action      *HumanAction `json:"action,omitempty"`
+	LastSeen    time.Time    `json:"last_seen"`
+	BootID      string       `json:"boot_id"`
+	Kernel      string       `json:"kernel"`
+	Cmdline     string       `json:"cmdline"`
+	KnownGood   string       `json:"known_good,omitempty"` // kernel release the baseline ran on
+	Facts       Facts        `json:"facts"`
+	Health      Health       `json:"health"`
+	Lease       *Lease       `json:"lease,omitempty"`
+	ActiveJob   string       `json:"active_job,omitempty"`
+}
+
+// Tier is how much of the recovery ladder a device supports: 0 panic reboot only,
+// 1 plus an armed hardware watchdog, 2 plus out-of-band reset and serial.
+func (d *Device) Tier() int {
+	t := 0
+	if d.Facts.WatchdogArmed {
+		t = 1
+	}
+	if d.OOB != nil {
+		t = 2
+	}
+	return t
+}
+
+// Facts are reported by the agent at startup and refreshed by preflight.
+type Facts struct {
+	Hostname      string   `json:"hostname"`
+	Machine       string   `json:"machine"`  // uname -m
+	DTModel       string   `json:"dt_model"` // /proc/device-tree/model
+	Bootloader    string   `json:"bootloader"`
+	Initramfs     string   `json:"initramfs"`
+	Watchdog      bool     `json:"watchdog"`
+	WatchdogArmed bool     `json:"watchdog_armed"`
+	PanicTimeout  int      `json:"panic_timeout"`
+	GUIUser       string   `json:"gui_user,omitempty"`
+	AgentVersion  string   `json:"agent_version"`
+	PreflightOK   bool     `json:"preflight_ok"`
+	Problems      []string `json:"problems,omitempty"`
+}
+
+type Health struct {
+	Uptime      float64 `json:"uptime"`
+	SystemState string  `json:"system_state"` // systemctl is-system-running
+	Tainted     int64   `json:"tainted"`
+	JobTag      string  `json:"job_tag,omitempty"` // maclab.job= from the running cmdline
+}
+
+// KernelEvent is a classified kernel log line, from the agent's /dev/kmsg or from serial.
+type KernelEvent struct {
+	Time   time.Time `json:"time"`
+	Kind   string    `json:"kind"`
+	Source string    `json:"source"` // "kmsg" or "serial"
+	BootID string    `json:"boot_id,omitempty"`
+	Line   string    `json:"line"`
+}
+
+// Checkin is the agent heartbeat. It also carries command results and new kernel events.
+type Checkin struct {
+	BootID  string          `json:"boot_id"`
+	Kernel  string          `json:"kernel"`
+	Cmdline string          `json:"cmdline"`
+	Facts   *Facts          `json:"facts,omitempty"`
+	Health  Health          `json:"health"`
+	Events  []KernelEvent   `json:"events,omitempty"`
+	Results []CommandResult `json:"results,omitempty"`
+	Running []string        `json:"running,omitempty"` // command IDs still executing
+}
+
+// Report carries command results and kernel events as soon as they exist.
+type Report struct {
+	Results []CommandResult `json:"results,omitempty"`
+	Events  []KernelEvent   `json:"events,omitempty"`
+}
+
+type CheckinResponse struct {
+	Commands   []Command `json:"commands,omitempty"`
+	IntervalMS int       `json:"interval_ms"`
+}
+
+// Command kinds sent to the agent.
+const (
+	CmdStage    = "stage"
+	CmdBootOnce = "boot_once"
+	CmdReboot   = "reboot"
+	CmdRunTest  = "run_test"
+	CmdCollect  = "collect"
+	CmdCleanup  = "cleanup"
+	CmdCrash    = "crash"
+	CmdScreen   = "screenshot"
+	CmdLogs     = "logs"
+	CmdConfig   = "config" // the running kernel's .config
+	CmdExec     = "exec"
+)
+
+type Command struct {
+	ID    string          `json:"id"`
+	Kind  string          `json:"kind"`
+	JobID string          `json:"job_id,omitempty"`
+	Args  json.RawMessage `json:"args,omitempty"`
+}
+
+type CommandResult struct {
+	ID     string          `json:"id"`
+	OK     bool            `json:"ok"`
+	Error  string          `json:"error,omitempty"`
+	Output json.RawMessage `json:"output,omitempty"`
+}
+
+type StageArgs struct {
+	Artifact string `json:"artifact"` // sha256
+	Cmdline  string `json:"cmdline"`  // extra args appended to the known-good cmdline
+	Serial   bool   `json:"serial"`   // add the debug UART console
+}
+
+type StageResult struct {
+	KernelRelease string `json:"kernel_release"`
+	Entry         string `json:"entry"`
+	Cmdline       string `json:"cmdline"`
+}
+
+type BootOnceArgs struct {
+	Entry string `json:"entry"`
+}
+
+type CollectArgs struct {
+	Boot string `json:"boot"` // journalctl -b value: "0" or "-1"
+}
+
+type CleanupArgs struct {
+	All bool `json:"all"` // remove every lab-staged kernel except the running one
+}
+
+// ScreenArgs asks for a capture of the GUI session. With a JobID the image is
+// stored with the job as screen/<label>.jpg, otherwise as the device's live screen.
+type ScreenArgs struct {
+	Label   string `json:"label,omitempty"`
+	WaitSec int    `json:"wait_sec,omitempty"` // how long to wait for a Wayland session
+}
+
+type ScreenResult struct {
+	Name   string    `json:"name"`
+	Time   time.Time `json:"time"`
+	Width  int       `json:"width,omitempty"`
+	Height int       `json:"height,omitempty"`
+}
+
+// LogsArgs reads the running system's logs.
+type LogsArgs struct {
+	Source string `json:"source"` // journal, kernel
+	Lines  int    `json:"lines"`
+	Unit   string `json:"unit,omitempty"`
+}
+
+type CrashArgs struct {
+	Mode string `json:"mode"` // "panic"
+}
+
+type TestSpec struct {
+	Name       string `json:"name"`
+	Builtin    string `json:"builtin,omitempty"` // name of a test embedded in the agent
+	Script     string `json:"script,omitempty"`  // artifact sha256 of a shell script
+	TimeoutSec int    `json:"timeout_sec,omitempty"`
+	GUI        bool   `json:"gui,omitempty"` // run as the GUI user inside their Wayland session
+}
+
+type TestResult struct {
+	Name     string   `json:"name"`
+	Passed   bool     `json:"passed"`
+	ExitCode int      `json:"exit_code"`
+	Seconds  float64  `json:"seconds"`
+	TimedOut bool     `json:"timed_out,omitempty"`
+	Tail     string   `json:"tail,omitempty"`
+	Files    []string `json:"files,omitempty"`
+	Error    string   `json:"error,omitempty"`
+}
+
+type JobState string
+
+const (
+	JobQueued     JobState = "queued"
+	JobBuilding   JobState = "building"
+	JobStaging    JobState = "staging"
+	JobBooting    JobState = "booting"
+	JobTesting    JobState = "testing"
+	JobCollecting JobState = "collecting"
+	JobRestoring  JobState = "restoring"
+	JobDone       JobState = "done"
+)
+
+// Outcomes, most specific first. Only "pass" is success.
+const (
+	OutcomePass        = "pass"
+	OutcomeTestsFailed = "tests_failed"
+	OutcomeUnhealthy   = "booted_unhealthy" // booted, but kernel errors or degraded system
+	OutcomePanicked    = "panicked"
+	OutcomeHung        = "hung"
+	OutcomeBootFailed  = "boot_failed" // came back on the known-good kernel without a clear cause
+	OutcomeStageFailed = "stage_failed"
+	OutcomeBuildFailed = "build_failed"
+	OutcomeInfra       = "infra_error"
+	OutcomeCanceled    = "canceled"
+)
+
+type JobSpec struct {
+	Device         string     `json:"device"`
+	Kernel         string     `json:"kernel,omitempty"` // artifact sha256; empty = reboot on the current kernel
+	Source         string     `json:"source,omitempty"` // build this first: a GitHub/git URL of a repo, branch, commit or PR
+	Build          string     `json:"build,omitempty"`  // the build job that produced Kernel
+	Cmdline        string     `json:"cmdline,omitempty"`
+	Tests          []TestSpec `json:"tests,omitempty"`
+	BootTimeoutSec int        `json:"boot_timeout_sec,omitempty"`
+	Crash          string     `json:"crash,omitempty"` // crash test mode, see CrashArgs
+	Baseline       bool       `json:"baseline,omitempty"`
+	Holder         string     `json:"holder,omitempty"`
+}
+
+type JobEvent struct {
+	Time time.Time `json:"time"`
+	Msg  string    `json:"msg"`
+}
+
+type JobResult struct {
+	Booted        bool          `json:"booted"`
+	BootKernel    string        `json:"boot_kernel,omitempty"`
+	BootSeconds   float64       `json:"boot_seconds,omitempty"`
+	FellBack      bool          `json:"fell_back,omitempty"`
+	Recovery      []string      `json:"recovery,omitempty"` // ladder steps that were needed
+	Tests         []TestResult  `json:"tests,omitempty"`
+	KernelEvents  []KernelEvent `json:"kernel_events,omitempty"`
+	NewErrorLines []string      `json:"new_error_lines,omitempty"` // dmesg errors not in the baseline
+	Logs          []string      `json:"logs,omitempty"`
+}
+
+type Job struct {
+	ID       string     `json:"id"`
+	Spec     JobSpec    `json:"spec"`
+	State    JobState   `json:"state"`
+	Outcome  string     `json:"outcome,omitempty"`
+	Summary  string     `json:"summary,omitempty"`
+	Created  time.Time  `json:"created"`
+	Updated  time.Time  `json:"updated"`
+	Events   []JobEvent `json:"events"`
+	Result   JobResult  `json:"result"`
+	Canceled bool       `json:"canceled,omitempty"`
+}
+
+type EnrollRequest struct {
+	Token string `json:"token"`
+	Facts Facts  `json:"facts"`
+}
+
+type EnrollResponse struct {
+	DeviceID string `json:"device_id"`
+	Name     string `json:"name"`
+	Secret   string `json:"secret"`
+}
+
+type EnrollTokenRequest struct {
+	Name  string `json:"name"`
+	Label string `json:"label"`
+	Model string `json:"model"`
+}
+
+type EnrollTokenResponse struct {
+	Token   string    `json:"token"`
+	Expires time.Time `json:"expires"`
+}
+
+type DevicePatch struct {
+	Label *string    `json:"label,omitempty"`
+	Model *string    `json:"model,omitempty"`
+	OOB   *OOBConfig `json:"oob,omitempty"`
+	NoOOB bool       `json:"no_oob,omitempty"`
+}
+
+type LeaseRequest struct {
+	Holder string `json:"holder"`
+	TTLSec int    `json:"ttl_sec"`
+}
+
+// Text renders the instruction for a notification or terminal.
+func (a *HumanAction) Text() string {
+	var b strings.Builder
+	for i, s := range a.Steps {
+		fmt.Fprintf(&b, "%d. %s\n", i+1, s)
+	}
+	fmt.Fprintf(&b, "Why: %s.", a.Why)
+	if a.LastLog != "" {
+		fmt.Fprintf(&b, "\nLast log line: %s", a.LastLog)
+	}
+	return b.String()
+}
+
+// ---- builds: kernels built from source by a builder host ----
+
+type BuildState string
+
+const (
+	BuildQueued   BuildState = "queued"
+	BuildRunning  BuildState = "running"
+	BuildDone     BuildState = "done"
+	BuildFailed   BuildState = "failed"
+	BuildCanceled BuildState = "canceled"
+)
+
+// Source is a git commit to build, resolved from whatever the user handed over.
+type Source struct {
+	Input string `json:"input"`         // what was given: a GitHub URL, git URL#ref, ...
+	Repo  string `json:"repo"`          // clone URL
+	Ref   string `json:"ref,omitempty"` // branch, tag or refs/pull/N/head, if one was named
+	SHA   string `json:"sha"`           // the exact commit built
+}
+
+// Build kinds. A kernel build makes a lab test artifact from a commit and a
+// Mac's config; a package build runs a PKGBUILD recipe with makepkg and makes
+// the release packages, byte for byte what testers install.
+const (
+	BuildKernel  = ""
+	BuildPackage = "package"
+)
+
+// BuildFile is one output of a package build.
+type BuildFile struct {
+	Name   string `json:"name"`
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
+}
+
+type Build struct {
+	ID        string      `json:"id"`
+	Kind      string      `json:"kind,omitempty"`   // "" (kernel) or "package"
+	Key       string      `json:"key"`              // sha256 of everything that decides the output: same key, same result
+	Source    Source      `json:"source"`           // package builds: the commit _commit was pointed at, if any
+	Device    string      `json:"device,omitempty"` // whose running config it uses
+	ConfigSHA string      `json:"config_sha"`
+	Recipe    string      `json:"recipe,omitempty"`     // package builds: artifact sha256 of the recipe tarball
+	RecipeDir string      `json:"recipe_dir,omitempty"` // where the recipe came from, for people
+	Pkgrel    string      `json:"pkgrel,omitempty"`     // pkgrel set on the recipe, if any
+	Files     []BuildFile `json:"files,omitempty"`      // package builds: the packages and the PKGBUILD as built
+	State     BuildState  `json:"state"`
+	Stage     string      `json:"stage,omitempty"`    // fetch, checkout, configure, build, package, upload
+	Progress  float64     `json:"progress,omitempty"` // 0..1 when known
+	ETA       float64     `json:"eta_sec,omitempty"`  // estimated seconds left, from earlier builds
+	Release   string      `json:"release,omitempty"`
+	Artifact  string      `json:"artifact,omitempty"` // what `lab run --kernel` boots; for packages, the kernel package
+	Size      int64       `json:"size,omitempty"`
+	Error     string      `json:"error,omitempty"`
+	Builder   string      `json:"builder,omitempty"`
+	Reused    bool        `json:"reused,omitempty"` // an earlier identical build was reused
+	Created   time.Time   `json:"created"`
+	Started   time.Time   `json:"started,omitempty"`
+	Updated   time.Time   `json:"updated"`
+	Seconds   float64     `json:"seconds,omitempty"`
+	LogLines  int         `json:"log_lines"`
+}
+
+type BuildRequest struct {
+	Source string `json:"source"`           // URL of a repo, branch, commit or pull request
+	Device string `json:"device,omitempty"` // build with this Mac's running config
+	Config string `json:"config,omitempty"` // or: artifact sha256 of a .config
+	Force  bool   `json:"force,omitempty"`  // rebuild even if an identical build exists
+
+	// Package builds: Recipe is the artifact sha256 of a tarball of a PKGBUILD
+	// directory. Source, if given, repoints the recipe's _commit; Pkgrel sets pkgrel.
+	Recipe    string `json:"recipe,omitempty"`
+	RecipeDir string `json:"recipe_dir,omitempty"`
+	Pkgrel    string `json:"pkgrel,omitempty"`
+}
+
+// BuildAssignment is what a builder host receives.
+type BuildAssignment struct {
+	Build  Build  `json:"build"`
+	LabVer string `json:"labver"` // release suffix, unique per build key
+}
+
+type BuildProgress struct {
+	Stage    string   `json:"stage,omitempty"`
+	Progress float64  `json:"progress,omitempty"`
+	Lines    []string `json:"lines,omitempty"`
+}
+
+type BuildResult struct {
+	Release  string      `json:"release,omitempty"`
+	Artifact string      `json:"artifact,omitempty"`
+	Files    []BuildFile `json:"files,omitempty"`
+	Error    string      `json:"error,omitempty"`
+	Seconds  float64     `json:"seconds"`
+}
+
+// ExecArgs runs a shell command on the Mac.
+type ExecArgs struct {
+	Command    string `json:"command"`
+	TimeoutSec int    `json:"timeout_sec,omitempty"`
+}
+
+type ExecResult struct {
+	ExitCode int     `json:"exit_code"`
+	Stdout   string  `json:"stdout"`
+	Stderr   string  `json:"stderr"`
+	Seconds  float64 `json:"seconds"`
+	Via      string  `json:"via"` // agent or serial
+}

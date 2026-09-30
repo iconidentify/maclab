@@ -1,0 +1,25 @@
+# maclab package builder: runs a PKGBUILD recipe with makepkg, on Arch Linux ARM,
+# so the packages match what the release build machine (m1) makes.
+# Build context: this directory plus ArchLinuxARM-aarch64-latest.tar.gz from
+# http://os.archlinuxarm.org/os/ (see README, "Release packages from a PKGBUILD").
+FROM scratch AS rootfs
+ADD ArchLinuxARM-aarch64-latest.tar.gz /
+# The build VM can't apply pacman's Landlock download sandbox.
+RUN sed -i 's/^\[options\]/[options]\nDisableSandbox/' /etc/pacman.conf \
+  && pacman-key --init && pacman-key --populate archlinuxarm \
+  && (pacman -Rdd --noconfirm linux-aarch64 linux-firmware || true)
+RUN pacman -Syu --noconfirm --needed base-devel git ccache pacman-contrib zstd \
+      bc dtc kmod libelf pahole cpio perl rustup rust-bindgen tar xz xmlto python \
+      clang lld llvm \
+  && rm -rf /boot/* /var/cache/pacman/pkg/* \
+  && useradd -m build \
+  && echo 'build ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/build
+COPY makepkg.conf /etc/makepkg.conf
+COPY maclab.conf /etc/makepkg.conf.d/maclab.conf
+COPY pkgbuild /usr/local/bin/pkgbuild
+
+# One flat layer: the stock rootfs carries a kernel and firmware we just removed.
+FROM scratch
+COPY --from=rootfs / /
+ENV LANG=C.UTF-8
+ENTRYPOINT ["/usr/local/bin/pkgbuild"]

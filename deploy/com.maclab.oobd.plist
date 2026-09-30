@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LaunchDaemon for the macOS controller host (e.g. the M3).
+     sudo cp com.maclab.oobd.plist /Library/LaunchDaemons/
+     sudo launchctl bootstrap system /Library/LaunchDaemons/com.maclab.oobd.plist
+     Runs as root because macvdmtool needs it. Set the token below. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.maclab.oobd</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/oobd</string>
+    <string>--listen</string><string>:7780</string>
+    <string>--tool</string><string>/usr/local/bin/macvdmtool</string>
+    <string>--serial</string><string>/dev/cu.debug-console</string>
+    <string>--log</string><string>/var/log/oobd-console.log</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>OOBD_TOKEN</key><string>CHANGE-ME</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardErrorPath</key><string>/var/log/oobd.log</string>
+</dict>
+</plist>
