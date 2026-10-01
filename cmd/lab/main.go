@@ -33,7 +33,7 @@ const usage = `lab: run kernels and tests on Omarchy Macs
   lab builds | lab build-log <build> [-f] | lab build-get <build> [-o dir]
   lab exec <device> <command...>      run a command on a Mac as root (agent, or serial if its network is down)
   lab run <device> [--kernel <file|sha256|build-id|github-url>] [--cmdline ".."] [--test boot-health] [--gui-test gui-smoke]
-                   [--script t.sh] [--gui-script t.sh] [--boot-timeout 240] [--publish] [--omt-allow ids] [--no-wait]
+                   [--script t.sh] [--gui-script t.sh] [--boot-timeout 240] [--script-timeout 90m] [--publish] [--omt-allow ids] [--no-wait]
   lab crashtest <device>              deliberately panic the Mac and check it recovers by itself
   lab pack --build <O= dir> [-o kernel.tar.zst]    package a kernel build for lab run
   lab jobs [device] | lab job <id> | lab wait <id> | lab cancel <id> | lab logs <id> [file]
@@ -189,6 +189,7 @@ func dispatch(ctx context.Context, c *client.Client, cmd string, args []string) 
 		cmdline := fs.String("cmdline", "", "extra kernel arguments")
 		bootTimeout := fs.Int("boot-timeout", 0, "seconds to wait for the Mac to come back (default 240)")
 		noWait := fs.Bool("no-wait", false, "queue and return")
+		scriptTimeout := fs.Duration("script-timeout", 0, "time each --script/--gui-script test may run, e.g. 90m for a hands-on session (default 5m, at most 4h)")
 		omtAllow := fs.String("omt-allow", "", "omarchy-m-test checks this kernel is expected to fail, comma-separated (hardware.drivers:<compatible> for one unbound node)")
 		publish := fs.Bool("publish", false, "publish the omarchy-m-test report to omarchy-m-testing.org (known-good kernel runs only)")
 		var tests, guiTests, scripts, guiScripts multi
@@ -202,6 +203,9 @@ func dispatch(ctx context.Context, c *client.Client, cmd string, args []string) 
 		}
 		spec := api.JobSpec{Device: pos[0], Cmdline: *cmdline, BootTimeoutSec: *bootTimeout, Holder: holder(), Publish: *publish}
 		spec.OMTAllow = splitAllow(*omtAllow)
+		if *scriptTimeout > 4*time.Hour {
+			return fmt.Errorf("--script-timeout %s: at most 4h", *scriptTimeout)
+		}
 		switch {
 		case isSource(*kernel):
 			spec.Source = *kernel
@@ -234,7 +238,7 @@ func dispatch(ctx context.Context, c *client.Client, cmd string, args []string) 
 					return err
 				}
 				name := strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
-				spec.Tests = append(spec.Tests, api.TestSpec{Name: name, Script: sha, GUI: i == 1})
+				spec.Tests = append(spec.Tests, api.TestSpec{Name: name, Script: sha, GUI: i == 1, TimeoutSec: int(scriptTimeout.Seconds())})
 			}
 		}
 		return submit(ctx, c, spec, *noWait)

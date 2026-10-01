@@ -57,20 +57,21 @@ func serveMCP(ctx context.Context) error {
 		})
 
 	type runArg struct {
-		Device         string   `json:"device"`
-		Source         string   `json:"source,omitempty" jsonschema:"build and boot this: a GitHub URL of a repo, branch (/tree/...), commit or pull request, or git URL#ref. Built with the Mac's own config; reused if built before"`
-		KernelPath     string   `json:"kernel_path,omitempty" jsonschema:"local path of a kernel artifact to upload; omit to reboot on the current kernel"`
-		KernelSHA256   string   `json:"kernel_sha256,omitempty" jsonschema:"sha256 of an artifact already uploaded"`
-		BuildID        string   `json:"build_id,omitempty" jsonschema:"boot the kernel of a finished build, e.g. the linux package of a lab_package build"`
-		Cmdline        string   `json:"cmdline,omitempty" jsonschema:"extra kernel command line arguments"`
-		Tests          []string `json:"tests,omitempty" jsonschema:"builtin tests: boot-health (always run), gui-smoke, gui-terminal"`
-		GUITests       []string `json:"gui_tests,omitempty" jsonschema:"builtin tests to run inside the GUI user's Hyprland session: gui-smoke, gui-terminal"`
-		Scripts        []string `json:"scripts,omitempty" jsonschema:"local paths of shell scripts to run as tests (as root); write outputs to $MACLAB_OUT"`
-		GUIScripts     []string `json:"gui_scripts,omitempty" jsonschema:"local paths of shell scripts to run in the Wayland session"`
-		BootTimeoutSec int      `json:"boot_timeout_sec,omitempty"`
-		OMTAllow       []string `json:"omt_allow,omitempty" jsonschema:"omarchy-m-test checks this kernel is expected to fail; hardware.drivers:<compatible> allows one unbound node"`
-		Publish        bool     `json:"publish,omitempty" jsonschema:"publish the omarchy-m-test report to omarchy-m-testing.org; only runs on the Mac's known-good kernel qualify"`
-		WaitSec        int      `json:"wait_sec,omitempty" jsonschema:"wait up to this long for the result (max 900); 0 returns once queued"`
+		Device           string   `json:"device"`
+		Source           string   `json:"source,omitempty" jsonschema:"build and boot this: a GitHub URL of a repo, branch (/tree/...), commit or pull request, or git URL#ref. Built with the Mac's own config; reused if built before"`
+		KernelPath       string   `json:"kernel_path,omitempty" jsonschema:"local path of a kernel artifact to upload; omit to reboot on the current kernel"`
+		KernelSHA256     string   `json:"kernel_sha256,omitempty" jsonschema:"sha256 of an artifact already uploaded"`
+		BuildID          string   `json:"build_id,omitempty" jsonschema:"boot the kernel of a finished build, e.g. the linux package of a lab_package build"`
+		Cmdline          string   `json:"cmdline,omitempty" jsonschema:"extra kernel command line arguments"`
+		Tests            []string `json:"tests,omitempty" jsonschema:"builtin tests: boot-health (always run), gui-smoke, gui-terminal"`
+		GUITests         []string `json:"gui_tests,omitempty" jsonschema:"builtin tests to run inside the GUI user's Hyprland session: gui-smoke, gui-terminal"`
+		Scripts          []string `json:"scripts,omitempty" jsonschema:"local paths of shell scripts to run as tests (as root); write outputs to $MACLAB_OUT"`
+		GUIScripts       []string `json:"gui_scripts,omitempty" jsonschema:"local paths of shell scripts to run in the Wayland session"`
+		BootTimeoutSec   int      `json:"boot_timeout_sec,omitempty"`
+		ScriptTimeoutSec int      `json:"script_timeout_sec,omitempty" jsonschema:"time each script test may run (default 300, at most 14400), e.g. 5400 for a hands-on session that waits for a person"`
+		OMTAllow         []string `json:"omt_allow,omitempty" jsonschema:"omarchy-m-test checks this kernel is expected to fail; hardware.drivers:<compatible> allows one unbound node"`
+		Publish          bool     `json:"publish,omitempty" jsonschema:"publish the omarchy-m-test report to omarchy-m-testing.org; only runs on the Mac's known-good kernel qualify"`
+		WaitSec          int      `json:"wait_sec,omitempty" jsonschema:"wait up to this long for the result (max 900); 0 returns once queued"`
 	}
 	mcp.AddTool(s, &mcp.Tool{Name: "lab_run", Description: "Boot a kernel on a Mac once and run tests. Give source (a GitHub URL) to build it first, or a kernel artifact. Returns the job; use lab_wait for the result."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, a runArg) (*mcp.CallToolResult, any, error) {
@@ -104,7 +105,7 @@ func serveMCP(ctx context.Context) error {
 					if err != nil {
 						return nil, nil, err
 					}
-					spec.Tests = append(spec.Tests, api.TestSpec{Name: strings.TrimSuffix(filepath.Base(p), filepath.Ext(p)), Script: sha, GUI: i == 1})
+					spec.Tests = append(spec.Tests, api.TestSpec{Name: strings.TrimSuffix(filepath.Base(p), filepath.Ext(p)), Script: sha, GUI: i == 1, TimeoutSec: min(a.ScriptTimeoutSec, 14400)})
 				}
 			}
 			return submitAndWait(ctx, c, spec, a.WaitSec, text)
