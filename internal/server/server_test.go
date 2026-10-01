@@ -669,7 +669,7 @@ func TestOmarchyMTest(t *testing.T) {
 	l.baseline()
 	jobs, _ := l.s.store.jobs("sim-mac", 1, false)
 	base := jobs[0]
-	if o := base.Result.OMT; o == nil || !o.KnownGood || o.Pass != 2 || o.Fail != 1 || o.Skip != 1 || o.Published != "https://site/reports/r1" {
+	if o := base.Result.OMT; o == nil || !o.KnownGood || o.Pass != 3 || o.Fail != 1 || o.Skip != 1 || o.Published != "https://site/reports/r1" {
 		t.Fatalf("baseline omt %+v", base.Result.OMT)
 	}
 	if len(posts) != 1 || !strings.Contains(posts[0], `"kernel":"`+agent.SimKnownGood+`"`) {
@@ -692,6 +692,16 @@ func TestOmarchyMTest(t *testing.T) {
 	if o := j.Result.OMT; o == nil || len(o.Regressions) != 1 || o.Regressions[0].ID != "wifi.connected" {
 		t.Fatalf("regressed omt %+v", j.Result.OMT)
 	}
+	// A kernel without the fingerprint driver, which the job says to expect, passes;
+	// the same kernel with a different node unbound would still fail.
+	j2 := l.run(api.JobSpec{Kernel: l.artifact("krel=7.2-tb behavior=omt-no-fingerprint"), OMTAllow: []string{"hardware.drivers:apple,mesa-fingerprint"}})
+	l.expect(j2, api.OutcomePass)
+	if o := j2.Result.OMT; len(o.Allowed) != 1 || len(o.Regressions) != 0 {
+		t.Fatalf("allowed omt %+v", o)
+	}
+	j2 = l.run(api.JobSpec{Kernel: l.artifact("krel=7.2-tb2 behavior=omt-no-fingerprint"), OMTAllow: []string{"hardware.drivers:apple,other"}})
+	l.expect(j2, api.OutcomeTestsFailed)
+
 	// And it can't be published: the site would file it under the packaged kernel.
 	if r, body := l.get("POST", "/api/jobs/"+j.ID+"/publish"); r.StatusCode != 409 || !strings.Contains(body, "lab kernel") {
 		t.Fatalf("publish of a lab kernel run: %s %s", r.Status, body)

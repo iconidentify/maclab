@@ -68,12 +68,13 @@ func serveMCP(ctx context.Context) error {
 		Scripts        []string `json:"scripts,omitempty" jsonschema:"local paths of shell scripts to run as tests (as root); write outputs to $MACLAB_OUT"`
 		GUIScripts     []string `json:"gui_scripts,omitempty" jsonschema:"local paths of shell scripts to run in the Wayland session"`
 		BootTimeoutSec int      `json:"boot_timeout_sec,omitempty"`
+		OMTAllow       []string `json:"omt_allow,omitempty" jsonschema:"omarchy-m-test checks this kernel is expected to fail; hardware.drivers:<compatible> allows one unbound node"`
 		Publish        bool     `json:"publish,omitempty" jsonschema:"publish the omarchy-m-test report to omarchy-m-testing.org; only runs on the Mac's known-good kernel qualify"`
 		WaitSec        int      `json:"wait_sec,omitempty" jsonschema:"wait up to this long for the result (max 900); 0 returns once queued"`
 	}
 	mcp.AddTool(s, &mcp.Tool{Name: "lab_run", Description: "Boot a kernel on a Mac once and run tests. Give source (a GitHub URL) to build it first, or a kernel artifact. Returns the job; use lab_wait for the result."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, a runArg) (*mcp.CallToolResult, any, error) {
-			spec := api.JobSpec{Device: a.Device, Kernel: a.KernelSHA256, Source: a.Source, Cmdline: a.Cmdline, BootTimeoutSec: a.BootTimeoutSec, Holder: who, Publish: a.Publish}
+			spec := api.JobSpec{Device: a.Device, Kernel: a.KernelSHA256, Source: a.Source, Cmdline: a.Cmdline, BootTimeoutSec: a.BootTimeoutSec, Holder: who, Publish: a.Publish, OMTAllow: a.OMTAllow}
 			if a.KernelPath != "" {
 				sha, err := c.Upload(ctx, a.KernelPath)
 				if err != nil {

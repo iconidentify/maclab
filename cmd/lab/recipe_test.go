@@ -34,3 +34,11 @@ install=x.install
 		t.Fatal("a missing local source should be an error")
 	}
 }
+
+func TestSplitAllow(t *testing.T) {
+	got := splitAllow("system.failed-units,hardware.drivers:apple,mesa-fingerprint, boot.files")
+	want := []string{"system.failed-units", "hardware.drivers:apple,mesa-fingerprint", "boot.files"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %q", got)
+	}
+}

@@ -347,15 +347,20 @@ func (s *Sim) omtReport(t api.TestSpec, outDir, behavior string) api.TestResult 
 	if kernel != SimKnownGood {
 		pkg = "fail" // a lab kernel is never an installed package
 	}
+	unclaimed, drivers := "[]", "pass"
 	if behavior == "omt-regress" {
 		wifi = "fail"
 	}
+	if behavior == "omt-no-fingerprint" {
+		unclaimed, drivers = `[{"compatible":"apple,mesa-fingerprint","count":1,"outcome":"unknown-hardware"}]`, "fail"
+	}
 	report := fmt.Sprintf(`{"schema_version":1,"tool":{"name":"omarchy-m-test","version":"0.1.10"},"consent_version":6,"catalogue_version":11,
-"machine":{"model":"Sim Mac","board":"j000","soc":"t0000","chip":"M0","arch":"aarch64","kernel":%q},"system":{"stack":"converged"},
+"inventory":{"unclaimed":%s},"machine":{"model":"Sim Mac","board":"j000","soc":"t0000","chip":"M0","arch":"aarch64","kernel":%q},"system":{"stack":"converged"},
 "checks":[{"id":"boot.kernel-package","kind":"automatic","status":%q,"evidence":["kernel package"],"classification":{"outcome":"works"}},
+{"id":"hardware.drivers","kind":"automatic","status":%q,"evidence":["nodes"],"classification":{"outcome":"works"}},
 {"id":"wifi.connected","kind":"automatic","status":%q,"evidence":["wlan0 up"],"classification":{"outcome":"works"}},
 {"id":"system.snapshots","kind":"automatic","status":"fail","evidence":["/.snapshots is not a btrfs subvolume"],"classification":{"outcome":"fails"}},
-{"id":"display.cursor","kind":"human","status":"skip","evidence":["no answer"]}],"signature":{"public_key":"ssh-ed25519 AAAA","signature":"sim"}}`, kernel, pkg, wifi)
+{"id":"display.cursor","kind":"human","status":"skip","evidence":["no answer"]}],"signature":{"public_key":"ssh-ed25519 AAAA","signature":"sim"}}`, unclaimed, kernel, pkg, drivers, wifi)
 	os.WriteFile(filepath.Join(outDir, "omt-report.json"), []byte(report), 0o644)
 	return api.TestResult{Name: t.Name, Passed: true, Seconds: 0.01, Tail: "omarchy-m-test 0.1.10 on " + kernel}
 }

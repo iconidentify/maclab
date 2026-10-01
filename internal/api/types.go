@@ -274,6 +274,10 @@ type JobSpec struct {
 	// Only a run on the Mac's known-good (packaged) kernel is ever published:
 	// the site names a report's build from pacman, which doesn't know lab kernels.
 	Publish bool `json:"publish,omitempty"`
+	// OMTAllow names omarchy-m-test checks this kernel is expected to fail
+	// (it lacks a feature on purpose): they're listed, not counted as regressions.
+	// "hardware.drivers:<compatible>" allows just that device-tree node to go unbound.
+	OMTAllow []string `json:"omt_allow,omitempty"`
 }
 
 type JobEvent struct {
@@ -309,6 +313,7 @@ type OMTResult struct {
 	Regressions []OMTCheck `json:"regressions,omitempty"`  // passed on the known-good kernel, fail here
 	Fixed       []OMTCheck `json:"fixed,omitempty"`        // failed on the known-good kernel, pass here
 	LabBoot     []OMTCheck `json:"lab_boot,omitempty"`     // regressed only because a lab kernel isn't an installed package
+	Allowed     []OMTCheck `json:"allowed,omitempty"`      // regressed, but the job said this kernel is expected to (omt_allow)
 	ComparedTo  string     `json:"compared_to,omitempty"`  // the baseline job, or why there was no comparison
 	Published   string     `json:"published,omitempty"`    // the report's page on omarchy-m-testing.org
 	PublishNote string     `json:"publish_note,omitempty"` // why it wasn't published, or the site's error

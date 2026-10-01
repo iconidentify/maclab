@@ -33,7 +33,7 @@ const usage = `lab: run kernels and tests on Omarchy Macs
   lab builds | lab build-log <build> [-f] | lab build-get <build> [-o dir]
   lab exec <device> <command...>      run a command on a Mac as root (agent, or serial if its network is down)
   lab run <device> [--kernel <file|sha256|build-id|github-url>] [--cmdline ".."] [--test boot-health] [--gui-test gui-smoke]
-                   [--script t.sh] [--gui-script t.sh] [--boot-timeout 240] [--publish] [--no-wait]
+                   [--script t.sh] [--gui-script t.sh] [--boot-timeout 240] [--publish] [--omt-allow ids] [--no-wait]
   lab crashtest <device>              deliberately panic the Mac and check it recovers by itself
   lab pack --build <O= dir> [-o kernel.tar.zst]    package a kernel build for lab run
   lab jobs [device] | lab job <id> | lab wait <id> | lab cancel <id> | lab logs <id> [file]
@@ -189,6 +189,7 @@ func dispatch(ctx context.Context, c *client.Client, cmd string, args []string) 
 		cmdline := fs.String("cmdline", "", "extra kernel arguments")
 		bootTimeout := fs.Int("boot-timeout", 0, "seconds to wait for the Mac to come back (default 240)")
 		noWait := fs.Bool("no-wait", false, "queue and return")
+		omtAllow := fs.String("omt-allow", "", "omarchy-m-test checks this kernel is expected to fail, comma-separated (hardware.drivers:<compatible> for one unbound node)")
 		publish := fs.Bool("publish", false, "publish the omarchy-m-test report to omarchy-m-testing.org (known-good kernel runs only)")
 		var tests, guiTests, scripts, guiScripts multi
 		fs.Var(&tests, "test", "builtin test to run (repeatable)")
@@ -200,6 +201,7 @@ func dispatch(ctx context.Context, c *client.Client, cmd string, args []string) 
 			return err
 		}
 		spec := api.JobSpec{Device: pos[0], Cmdline: *cmdline, BootTimeoutSec: *bootTimeout, Holder: holder(), Publish: *publish}
+		spec.OMTAllow = splitAllow(*omtAllow)
 		switch {
 		case isSource(*kernel):
 			spec.Source = *kernel
@@ -579,6 +581,9 @@ func printJob(j *api.Job, events bool) {
 		for _, c := range o.Fixed {
 			fmt.Printf("    fixed     %s\n", c.ID)
 		}
+		for _, c := range o.Allowed {
+			fmt.Printf("    allowed   %s (--omt-allow)\n", c.ID)
+		}
 		for _, c := range o.LabBoot {
 			fmt.Printf("    lab boot  %s (fails for any kernel that isn't an installed package)\n", c.ID)
 		}
@@ -834,6 +839,24 @@ func printBuild(b *api.Build) {
 	if len(b.Files) > 0 {
 		fmt.Printf("  download: lab build-get %s -o <dir>\n", b.ID)
 	}
+}
+
+// splitAllow splits --omt-allow on commas. Check ids always have a dot and a
+// device-tree compatible's own comma doesn't start one, so a piece without a
+// dot belongs to the one before it: hardware.drivers:apple,mesa-fingerprint.
+func splitAllow(v string) []string {
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		p = strings.TrimSpace(p)
+		switch {
+		case p == "":
+		case !strings.Contains(p, ".") && len(out) > 0 && strings.Contains(out[len(out)-1], ":"):
+			out[len(out)-1] += "," + p
+		default:
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 var reBuildID = regexp.MustCompile(`^b[0-9]{4}-[0-9]{6}-[0-9a-f]{4}$`)

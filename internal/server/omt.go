@@ -44,6 +44,11 @@ type omtReport struct {
 	Machine   struct {
 		Kernel string `json:"kernel"`
 	} `json:"machine"`
+	Inventory struct {
+		Unclaimed []struct {
+			Compatible string `json:"compatible"`
+		} `json:"unclaimed"`
+	} `json:"inventory"`
 	Checks []struct {
 		ID             string   `json:"id"`
 		Status         string   `json:"status"`
@@ -150,6 +155,7 @@ func (r *jobRun) omtResult(tr *api.TestResult) {
 			}
 		}
 		res.Regressions = kept
+		res.Regressions, res.Allowed = omtAllowed(res.Regressions, j.Spec.OMTAllow, rep)
 		res.ComparedTo = "known-good run " + base.Job + " on " + base.Kernel
 		if base.Tool != res.Tool {
 			res.ComparedTo += fmt.Sprintf(" (omarchy-m-test %s then, %s now)", base.Tool, res.Tool)
@@ -173,6 +179,35 @@ func (r *jobRun) omtResult(tr *api.TestResult) {
 		tr.Passed = false
 		tr.Error = fmt.Sprintf("%d checks pass on the known-good kernel and fail on this one: %s", len(ids), strings.Join(ids, ", "))
 	}
+}
+
+// omtAllowed moves the regressions a job said to expect out of the way. A
+// plain check id allows that check; "hardware.drivers:<compatible>" allows the
+// driver check only when every node left unbound is one of the named ones.
+func omtAllowed(regressed []api.OMTCheck, allow []string, rep omtReport) (kept, allowed []api.OMTCheck) {
+	ids, compat := map[string]bool{}, map[string]bool{}
+	for _, a := range allow {
+		if c, ok := strings.CutPrefix(a, "hardware.drivers:"); ok {
+			compat[c] = true
+		} else {
+			ids[a] = true
+		}
+	}
+	for _, c := range regressed {
+		ok := ids[c.ID]
+		if !ok && c.ID == "hardware.drivers" && len(compat) > 0 && len(rep.Inventory.Unclaimed) > 0 {
+			ok = true
+			for _, u := range rep.Inventory.Unclaimed {
+				ok = ok && compat[u.Compatible]
+			}
+		}
+		if ok {
+			allowed = append(allowed, c)
+		} else {
+			kept = append(kept, c)
+		}
+	}
+	return kept, allowed
 }
 
 // omtDiff lists the checks that went from pass to fail, and from fail to pass.

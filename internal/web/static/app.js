@@ -578,6 +578,7 @@ function omtSection(j) {
   if (!o) return '';
   const item = (c, color, tag) => `<li style="--c:${color}"><span class="k">${tag}</span><b>${esc(c.id)}</b>${c.evidence ? ` · ${esc(c.evidence)}` : ''}</li>`;
   const changed = [...(o.regressions || []).map(c => item(c, 'var(--bad)', 'regressed')), ...(o.fixed || []).map(c => item(c, 'var(--ok)', 'fixed')),
+    ...(o.allowed || []).map(c => item(c, 'var(--faint)', 'allowed')),
     ...(o.lab_boot || []).map(c => item({ ...c, evidence: 'fails for any kernel that is not an installed package' }, 'var(--faint)', 'lab boot'))];
   const canPublish = j.state === 'done' && o.known_good && !o.published;
   return `<div class="section"><div class="h">omarchy-m-test <span class="muted" style="font-weight:400">${esc(o.tool)} · ${o.pass} pass · ${o.fail} fail · ${o.skip} skipped</span></div>

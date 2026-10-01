@@ -189,7 +189,10 @@ answered yes. The run takes 1 to 3 minutes.
 - **Lab kernels** are compared with that reference. A check that passes on the
   known-good kernel and fails on the test kernel is a regression and fails the job.
   `boot.files` and `boot.kernel-package` are listed apart: they fail for any
-  kernel that isn't an installed package.
+  kernel that isn't an installed package. A kernel that lacks a feature on
+  purpose names what it's expected to fail: `--omt-allow system.failed-units`,
+  or `--omt-allow hardware.drivers:<compatible>` for one device-tree node, which
+  still fails the job if any other node stops binding.
 - **Publishing:** `lab run <mac> --publish`, `lab publish <job>`, or the job page's
   Publish button uploads the signed report to omarchy-m-testing.org. Only
   known-good runs qualify, because the site names a report's build from the
