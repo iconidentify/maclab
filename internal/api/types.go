@@ -270,6 +270,10 @@ type JobSpec struct {
 	Crash          string     `json:"crash,omitempty"` // crash test mode, see CrashArgs
 	Baseline       bool       `json:"baseline,omitempty"`
 	Holder         string     `json:"holder,omitempty"`
+	// Publish uploads the job's omarchy-m-test report to omarchy-m-testing.org.
+	// Only a run on the Mac's known-good (packaged) kernel is ever published:
+	// the site names a report's build from pacman, which doesn't know lab kernels.
+	Publish bool `json:"publish,omitempty"`
 }
 
 type JobEvent struct {
@@ -287,6 +291,33 @@ type JobResult struct {
 	KernelEvents  []KernelEvent `json:"kernel_events,omitempty"`
 	NewErrorLines []string      `json:"new_error_lines,omitempty"` // dmesg errors not in the baseline
 	Logs          []string      `json:"logs,omitempty"`
+	OMT           *OMTResult    `json:"omt,omitempty"` // omarchy-m-test, when it ran
+}
+
+// OMTResult summarizes an omarchy-m-test report (github.com/maralcbr/omarchy-m-testing)
+// and compares it with the same Mac's report on its known-good kernel.
+type OMTResult struct {
+	Report      string     `json:"report"` // job file holding the signed report
+	Tool        string     `json:"tool"`
+	Catalogue   int        `json:"catalogue"`
+	Kernel      string     `json:"kernel"`
+	KnownGood   bool       `json:"known_good"` // ran on the Mac's known-good kernel: becomes the baseline
+	Pass        int        `json:"pass"`
+	Fail        int        `json:"fail"`
+	Skip        int        `json:"skip"`
+	Fails       []OMTCheck `json:"fails,omitempty"`
+	Regressions []OMTCheck `json:"regressions,omitempty"`  // passed on the known-good kernel, fail here
+	Fixed       []OMTCheck `json:"fixed,omitempty"`        // failed on the known-good kernel, pass here
+	LabBoot     []OMTCheck `json:"lab_boot,omitempty"`     // regressed only because a lab kernel isn't an installed package
+	ComparedTo  string     `json:"compared_to,omitempty"`  // the baseline job, or why there was no comparison
+	Published   string     `json:"published,omitempty"`    // the report's page on omarchy-m-testing.org
+	PublishNote string     `json:"publish_note,omitempty"` // why it wasn't published, or the site's error
+}
+
+type OMTCheck struct {
+	ID       string `json:"id"`
+	Outcome  string `json:"outcome,omitempty"` // the catalogue's reading: fails, gap, n/a...
+	Evidence string `json:"evidence,omitempty"`
 }
 
 type Job struct {

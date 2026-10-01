@@ -244,7 +244,14 @@ func guiEnv(name string, wait time.Duration) (*user.User, []string, error) {
 			}
 		}
 		if sock != "" {
-			env := []string{"XDG_RUNTIME_DIR=" + run, "WAYLAND_DISPLAY=" + sock, "HOME=" + u.HomeDir, "USER=" + u.Username}
+			env := []string{"XDG_RUNTIME_DIR=" + run, "WAYLAND_DISPLAY=" + sock, "HOME=" + u.HomeDir, "USER=" + u.Username,
+				"DBUS_SESSION_BUS_ADDRESS=unix:path=" + run + "/bus"}
+			// The user's desktop session, so a test counts as run at the Mac's own seat.
+			if o, err := exec.Command("loginctl", "show-user", u.Username, "--property=Display", "--value").Output(); err == nil {
+				if id := strings.TrimSpace(string(o)); id != "" {
+					env = append(env, "XDG_SESSION_ID="+id)
+				}
+			}
 			if sigs, _ := filepath.Glob(filepath.Join(run, "hypr", "*")); len(sigs) > 0 {
 				env = append(env, "HYPRLAND_INSTANCE_SIGNATURE="+filepath.Base(sigs[len(sigs)-1]))
 			}

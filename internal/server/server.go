@@ -46,6 +46,14 @@ type Config struct {
 	BuilderToken string
 	// ArtifactBudget caps the artifact store; unreferenced artifacts go first.
 	ArtifactBudget int64
+	// OMT runs omarchy-m-test in every job on Macs with a desktop user.
+	OMT bool
+	// OMTSite is where omarchy-m-test reports are published; empty never publishes.
+	OMTSite string
+	// OMTPublish publishes known-good runs (baselines and scheduled runs) by itself.
+	OMTPublish bool
+	// OMTEvery re-runs omarchy-m-test on each idle Mac's known-good kernel this often; 0 never.
+	OMTEvery time.Duration
 }
 
 type Server struct {
@@ -126,6 +134,7 @@ func New(ctx context.Context, cfg Config, logger *log.Logger) (*Server, error) {
 	go s.monitor()
 	go s.buildMonitor()
 	go s.gcLoop()
+	go s.omtScheduler()
 	return s, nil
 }
 
@@ -352,6 +361,7 @@ func (s *Server) Handler() http.Handler {
 	m.HandleFunc("GET /api/jobs/{id}", s.admin(s.hJob))
 	m.HandleFunc("GET /api/jobs/{id}/wait", s.admin(s.hWait))
 	m.HandleFunc("POST /api/jobs/{id}/cancel", s.admin(s.hCancel))
+	m.HandleFunc("POST /api/jobs/{id}/publish", s.admin(s.hPublish))
 	m.HandleFunc("GET /api/jobs/{id}/files/{name...}", s.admin(s.hJobFile))
 	m.HandleFunc("POST /api/builder/poll", s.builderAuth(s.hBuilderPoll))
 	m.HandleFunc("POST /api/builder/builds/{id}/progress", s.builderAuth(s.hBuilderProgress))
@@ -843,6 +853,21 @@ func (s *Server) Submit(spec api.JobSpec) (*api.Job, int, error) {
 		return nil, 400, fmt.Errorf("unknown crash mode %q", spec.Crash)
 	}
 	d := s.view(v)
+	if spec.Crash == "" {
+		has := false
+		for i, t := range spec.Tests {
+			if t.Builtin == omtTest {
+				has = true
+				spec.Tests[i].GUI = true
+				if t.TimeoutSec == 0 {
+					spec.Tests[i].TimeoutSec = omtSpec().TimeoutSec
+				}
+			}
+		}
+		if !has && s.omtWanted(v.snapshot(), spec) {
+			spec.Tests = append(spec.Tests, omtSpec())
+		}
+	}
 	if d.KnownGood == "" && !spec.Baseline {
 		return nil, 409, fmt.Errorf("%s has not passed a baseline yet: run `lab baseline %s` first", d.Name, d.Name)
 	}
@@ -911,6 +936,25 @@ func (s *Server) hWait(w http.ResponseWriter, r *http.Request) {
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
+}
+
+// hPublish uploads a finished job's omarchy-m-test report to omarchy-m-testing.org.
+func (s *Server) hPublish(w http.ResponseWriter, r *http.Request) {
+	j, err := s.store.job(r.PathValue("id"))
+	if err != nil {
+		httpErr(w, 404, "no job %s", r.PathValue("id"))
+		return
+	}
+	if j.State != api.JobDone {
+		httpErr(w, 409, "job %s is still %s", j.ID, j.State)
+		return
+	}
+	url, err := s.omtPublish(r.Context(), j)
+	if err != nil {
+		httpErr(w, 409, "not published: %v", err)
+		return
+	}
+	writeJSON(w, map[string]string{"report_url": url})
 }
 
 func (s *Server) hCancel(w http.ResponseWriter, r *http.Request) {

@@ -33,10 +33,11 @@ const usage = `lab: run kernels and tests on Omarchy Macs
   lab builds | lab build-log <build> [-f] | lab build-get <build> [-o dir]
   lab exec <device> <command...>      run a command on a Mac as root (agent, or serial if its network is down)
   lab run <device> [--kernel <file|sha256|build-id|github-url>] [--cmdline ".."] [--test boot-health] [--gui-test gui-smoke]
-                   [--script t.sh] [--gui-script t.sh] [--boot-timeout 240] [--no-wait]
+                   [--script t.sh] [--gui-script t.sh] [--boot-timeout 240] [--publish] [--no-wait]
   lab crashtest <device>              deliberately panic the Mac and check it recovers by itself
   lab pack --build <O= dir> [-o kernel.tar.zst]    package a kernel build for lab run
   lab jobs [device] | lab job <id> | lab wait <id> | lab cancel <id> | lab logs <id> [file]
+  lab publish <job>                   upload a known-good run's omarchy-m-test report to omarchy-m-testing.org
   lab lease <device> [--ttl 1h] | lab release <device>
   lab reset <device>                  run the recovery ladder on an idle Mac by hand
   lab shell <device>                  shell over the serial link: works with the Mac's network down (Ctrl-] exits)
@@ -188,6 +189,7 @@ func dispatch(ctx context.Context, c *client.Client, cmd string, args []string) 
 		cmdline := fs.String("cmdline", "", "extra kernel arguments")
 		bootTimeout := fs.Int("boot-timeout", 0, "seconds to wait for the Mac to come back (default 240)")
 		noWait := fs.Bool("no-wait", false, "queue and return")
+		publish := fs.Bool("publish", false, "publish the omarchy-m-test report to omarchy-m-testing.org (known-good kernel runs only)")
 		var tests, guiTests, scripts, guiScripts multi
 		fs.Var(&tests, "test", "builtin test to run (repeatable)")
 		fs.Var(&guiTests, "gui-test", "builtin GUI test to run in the Wayland session (repeatable)")
@@ -197,7 +199,7 @@ func dispatch(ctx context.Context, c *client.Client, cmd string, args []string) 
 		if err := need(pos, 1, "lab run <device> [flags]"); err != nil {
 			return err
 		}
-		spec := api.JobSpec{Device: pos[0], Cmdline: *cmdline, BootTimeoutSec: *bootTimeout, Holder: holder()}
+		spec := api.JobSpec{Device: pos[0], Cmdline: *cmdline, BootTimeoutSec: *bootTimeout, Holder: holder(), Publish: *publish}
 		switch {
 		case isSource(*kernel):
 			spec.Source = *kernel
@@ -367,6 +369,18 @@ func dispatch(ctx context.Context, c *client.Client, cmd string, args []string) 
 			return err
 		}
 		return follow(ctx, c, pos[0])
+
+	case "publish":
+		pos := parse(fs, args)
+		if err := need(pos, 1, "lab publish <job>"); err != nil {
+			return err
+		}
+		url, err := c.Publish(ctx, pos[0])
+		if err != nil {
+			return err
+		}
+		fmt.Println(url)
+		return nil
 
 	case "cancel":
 		pos := parse(fs, args)
@@ -554,6 +568,25 @@ func printJob(j *api.Job, events bool) {
 				break
 			}
 			fmt.Printf("    %s\n", l)
+		}
+	}
+	if o := r.OMT; o != nil {
+		fmt.Printf("  omarchy-m-test %s on %s: %d pass, %d fail, %d skipped\n", o.Tool, o.Kernel, o.Pass, o.Fail, o.Skip)
+		fmt.Printf("    compared with %s\n", o.ComparedTo)
+		for _, c := range o.Regressions {
+			fmt.Printf("    REGRESSED %s: %s\n", c.ID, trunc(c.Evidence, 100))
+		}
+		for _, c := range o.Fixed {
+			fmt.Printf("    fixed     %s\n", c.ID)
+		}
+		for _, c := range o.LabBoot {
+			fmt.Printf("    lab boot  %s (fails for any kernel that isn't an installed package)\n", c.ID)
+		}
+		switch {
+		case o.Published != "":
+			fmt.Printf("    published: %s\n", o.Published)
+		case o.PublishNote != "":
+			fmt.Printf("    not published: %s\n", o.PublishNote)
 		}
 	}
 	for _, e := range r.KernelEvents {

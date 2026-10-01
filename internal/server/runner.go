@@ -246,11 +246,21 @@ func (r *jobRun) execute(ctx context.Context) (string, string) {
 		if err != nil {
 			tr = api.TestResult{Name: t.Name, ExitCode: -1, Error: err.Error()}
 		}
+		if t.Builtin == omtTest && err == nil {
+			r.omtResult(&tr)
+		}
 		if !tr.Passed {
 			failed++
 		}
 		r.s.updateJob(j, func(j *api.Job) { j.Result.Tests = append(j.Result.Tests, tr) })
 		r.ev("test %s: %s", t.Name, testVerdict(tr))
+	}
+	if omt := r.currentOMT(); omt != nil && (j.Spec.Publish || (r.s.cfg.OMTPublish && j.Spec.Baseline)) {
+		if url, err := r.s.omtPublish(ctx, j); err != nil {
+			r.ev("omarchy-m-test report not published: %v", err)
+		} else {
+			r.ev("omarchy-m-test report published: %s", url)
+		}
 	}
 
 	r.capture("after-tests")
@@ -293,6 +303,14 @@ func (r *jobRun) execute(ctx context.Context) (string, string) {
 		sum += fmt.Sprintf(", %d new kernel warning/error lines vs baseline", len(newLines))
 	}
 	return api.OutcomePass, sum
+}
+
+func (r *jobRun) currentOMT() *api.OMTResult {
+	j, err := r.s.store.job(r.j.ID)
+	if err != nil {
+		return nil
+	}
+	return j.Result.OMT
 }
 
 func testVerdict(t api.TestResult) string {

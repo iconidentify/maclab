@@ -24,7 +24,7 @@ import (
 	"github.com/iconidentify/maclab/internal/detect"
 )
 
-const Version = "0.2.0"
+const Version = "0.3.0"
 
 type Config struct {
 	Server   string `json:"server"`

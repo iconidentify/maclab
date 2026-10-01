@@ -26,6 +26,10 @@ func main() {
 	bootTimeout := flag.Duration("boot-timeout", 4*time.Minute, "default time a Mac gets to come back after a reboot")
 	artifactGB := flag.Int64("artifact-budget-gb", 20, "cap on the kernel artifact store; unreferenced artifacts go first")
 	trust := flag.String("trust", os.Getenv("MACLAB_TRUST"), "networks that get admin access without a token, e.g. 192.168.1.0/24,127.0.0.1 (anyone there can reboot Macs and run commands on them)")
+	omt := flag.Bool("omt", true, "run omarchy-m-test (github.com/maralcbr/omarchy-m-testing) in every job on Macs with a desktop user, and compare it with the known-good kernel")
+	omtSite := flag.String("omt-site", "https://omarchy-m-testing.org", "where omarchy-m-test reports are published (lab publish, --publish); empty never publishes")
+	omtPublish := flag.Bool("omt-publish", false, "publish known-good omarchy-m-test runs (baselines and --omt-every runs) by themselves")
+	omtEvery := flag.Duration("omt-every", 0, "re-run omarchy-m-test on each idle Mac's known-good kernel this often, e.g. 24h (reboots the Mac); 0 never")
 	flag.Parse()
 	trusted, err := server.ParseTrust(*trust)
 	if err != nil {
@@ -63,6 +67,7 @@ func main() {
 		log.Printf("no token needed from %s", *trust)
 	}
 	s, err := server.New(ctx, server.Config{DataDir: *data, AdminToken: strings.TrimSpace(string(tok)), Trust: trusted,
+		OMT: *omt, OMTSite: *omtSite, OMTPublish: *omtPublish, OMTEvery: *omtEvery,
 		BootTimeout: *bootTimeout, NtfyURL: *ntfy, NotifyCmd: *notifyCmd,
 		BuilderToken: strings.TrimSpace(string(btok)), ArtifactBudget: *artifactGB << 30}, nil)
 	if err != nil {

@@ -18,7 +18,8 @@ import (
 )
 
 // Sim is a pretend Mac. A kernel artifact for it is a text file such as
-// "krel=7.1-test behavior=panic"; behaviors are ok, panic (at boot),
+// "krel=7.1-test behavior=panic"; behaviors are ok, omt-regress (boots, but
+// Wi-Fi fails in omarchy-m-test), panic (at boot),
 // hang (at boot), silent (hang with no serial output) and crash-in-test.
 // A test named suspend-* puts it to sleep for SuspendFor, announcing it the way
 // logind does; one named quiet-suspend-* sleeps without announcing it.
@@ -242,6 +243,9 @@ func (s *Sim) RunTest(ctx context.Context, job string, t api.TestSpec, fetch Fet
 	s.mu.Lock()
 	b := s.behavior
 	s.mu.Unlock()
+	if t.Builtin == "omarchy-m-test" {
+		return s.omtReport(t, outDir, b)
+	}
 	if strings.HasPrefix(t.Name, "suspend-") || strings.HasPrefix(t.Name, "quiet-suspend-") {
 		s.suspend(s.SuspendFor, strings.HasPrefix(t.Name, "suspend-"))
 	}
@@ -332,4 +336,26 @@ func (s *Sim) KernelConfig() (string, error) {
 
 func (s *Sim) Exec(ctx context.Context, a api.ExecArgs) api.ExecResult {
 	return api.ExecResult{Stdout: "sim ran: " + a.Command + "\n", Via: "agent"}
+}
+
+// omtReport writes a small omarchy-m-test report like the real tool's.
+func (s *Sim) omtReport(t api.TestSpec, outDir, behavior string) api.TestResult {
+	s.mu.Lock()
+	kernel := s.kernel
+	s.mu.Unlock()
+	wifi, pkg := "pass", "pass"
+	if kernel != SimKnownGood {
+		pkg = "fail" // a lab kernel is never an installed package
+	}
+	if behavior == "omt-regress" {
+		wifi = "fail"
+	}
+	report := fmt.Sprintf(`{"schema_version":1,"tool":{"name":"omarchy-m-test","version":"0.1.10"},"consent_version":6,"catalogue_version":11,
+"machine":{"model":"Sim Mac","board":"j000","soc":"t0000","chip":"M0","arch":"aarch64","kernel":%q},"system":{"stack":"converged"},
+"checks":[{"id":"boot.kernel-package","kind":"automatic","status":%q,"evidence":["kernel package"],"classification":{"outcome":"works"}},
+{"id":"wifi.connected","kind":"automatic","status":%q,"evidence":["wlan0 up"],"classification":{"outcome":"works"}},
+{"id":"system.snapshots","kind":"automatic","status":"fail","evidence":["/.snapshots is not a btrfs subvolume"],"classification":{"outcome":"fails"}},
+{"id":"display.cursor","kind":"human","status":"skip","evidence":["no answer"]}],"signature":{"public_key":"ssh-ed25519 AAAA","signature":"sim"}}`, kernel, pkg, wifi)
+	os.WriteFile(filepath.Join(outDir, "omt-report.json"), []byte(report), 0o644)
+	return api.TestResult{Name: t.Name, Passed: true, Seconds: 0.01, Tail: "omarchy-m-test 0.1.10 on " + kernel}
 }

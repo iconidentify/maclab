@@ -173,6 +173,34 @@ Measured on a base M5 (10 cores, VM with 16 GB) with aurora's config: first buil
 rebuild of a warm tree about 40 seconds. Progress (stage, object count, ETA) and the log stream
 live on `/api/stream` (`build`, `buildlog`) and `/api/builds/{id}/log?follow=1`.
 
+## omarchy-m-test: hardware checks in every job
+
+On a Mac with a desktop user, every job also runs
+[omarchy-m-test](https://github.com/maralcbr/omarchy-m-testing) in the desktop
+session: about 70 checks of the boot chain, drivers, GPU, video decode, display,
+audio, Wi-Fi, power and CPU, and short benchmarks. The agent installs or upgrades
+the tool with its own installer, which checks the release signature. It answers
+the disclaimer and then gives no more input, so every question meant for a person
+(look at the screen, close the lid, reload Wi-Fi, upload) is skipped, never
+answered yes. The run takes 1 to 3 minutes.
+
+- **Known-good runs** (`lab baseline`, `lab run <mac>` with no kernel) become the
+  Mac's reference report.
+- **Lab kernels** are compared with that reference. A check that passes on the
+  known-good kernel and fails on the test kernel is a regression and fails the job.
+  `boot.files` and `boot.kernel-package` are listed apart: they fail for any
+  kernel that isn't an installed package.
+- **Publishing:** `lab run <mac> --publish`, `lab publish <job>`, or the job page's
+  Publish button uploads the signed report to omarchy-m-testing.org. Only
+  known-good runs qualify, because the site names a report's build from the
+  installed packages, and those don't describe a lab kernel. The site's deletion
+  link stays in the job's `omt-published.json`.
+
+```sh
+labd --omt-publish --omt-every 24h   # refresh each idle Mac's known-good report daily, and publish it
+labd --omt=false                     # don't add it to jobs
+```
+
 ## Release packages from a PKGBUILD
 
 ```sh
@@ -240,7 +268,7 @@ claude mcp add maclab -- lab mcp
 Tools: `lab_devices`, `lab_device`, `lab_run`, `lab_wait`, `lab_job`, `lab_jobs`,
 `lab_log`, `lab_screenshot`, `lab_baseline`, `lab_crashtest`, `lab_lease`,
 `lab_release`, `lab_reset`, `lab_serial`, `lab_exec`, `lab_cancel`, `lab_build`,
-`lab_build_status` and `lab_package`. A device in `needs_hands` is waiting for a
+`lab_build_status`, `lab_package` and `lab_publish`. A device in `needs_hands` is waiting for a
 person. Tell the user; don't retry.
 
 A lab is worth describing to its agents once: which Macs you have, which one has

@@ -572,6 +572,31 @@ function jobBuild(j) {
   return `<div class="bline">${ic('hammer')} built <a href="#/builds/${esc(b.id)}">${esc(b.release || b.id)}</a> from ${esc(repoName(b.source))} <code>${esc(shortSha(b.source?.sha))}</code>${b.seconds ? ` in ${dur(b.seconds)}` : ''}${b.reused ? ' · reused' : ''}</div>`;
 }
 
+// omarchy-m-test: the hardware checks it ran, what changed from the known-good kernel, and where it's published.
+function omtSection(j) {
+  const o = j.result?.omt;
+  if (!o) return '';
+  const item = (c, color, tag) => `<li style="--c:${color}"><span class="k">${tag}</span><b>${esc(c.id)}</b>${c.evidence ? ` · ${esc(c.evidence)}` : ''}</li>`;
+  const changed = [...(o.regressions || []).map(c => item(c, 'var(--bad)', 'regressed')), ...(o.fixed || []).map(c => item(c, 'var(--ok)', 'fixed')),
+    ...(o.lab_boot || []).map(c => item({ ...c, evidence: 'fails for any kernel that is not an installed package' }, 'var(--faint)', 'lab boot'))];
+  const canPublish = j.state === 'done' && o.known_good && !o.published;
+  return `<div class="section"><div class="h">omarchy-m-test <span class="muted" style="font-weight:400">${esc(o.tool)} · ${o.pass} pass · ${o.fail} fail · ${o.skip} skipped</span></div>
+    <div class="muted" style="margin:-2px 0 8px">compared with ${esc(o.compared_to || 'nothing')}</div>
+    ${changed.length ? `<ul class="lines">${changed.join('')}</ul>` : `<ul class="lines"><li style="--c:var(--ok)">${o.known_good ? 'known-good run: the reference for this Mac' : 'nothing changed from the known-good kernel'}</li></ul>`}
+    ${o.fails?.length ? `<details class="test" style="margin-top:8px"><summary><span class="nm">All ${o.fails.length} failing checks</span><span class="tm">on this Mac's setup, not only this kernel</span></summary>
+      <ul class="lines" style="margin-top:6px">${o.fails.map(c => item(c, 'var(--warn)', c.outcome || 'fail')).join('')}</ul></details>` : ''}
+    <div class="row" style="margin-top:10px;gap:10px;flex-wrap:wrap">
+      ${o.published ? `<a class="btn sm" href="${esc(o.published)}" target="_blank" rel="noopener">${ic('cloud')} Published on omarchy-m-testing.org</a>`
+        : o.publish_note ? `<span class="muted">not published: ${esc(o.publish_note)}</span>` : ''}
+      ${canPublish ? `<button class="btn sm primary" onclick="publishOMT('${esc(j.id)}')">${ic('upload')} Publish</button>` : ''}
+    </div></div>`;
+}
+
+async function publishOMT(id) {
+  try { const r = await post(`/api/jobs/${enc(id)}/publish`); toast('Published', r.report_url); tick(); }
+  catch (e) { toast('Not published', e.message, true); }
+}
+
 function overview(j) {
   const r = j.result || {};
   const s = j.spec || {};
@@ -585,6 +610,7 @@ function overview(j) {
     ${r.recovery?.length ? `<div class="section"><div class="h">Recovery</div><ul class="lines">${r.recovery.map(x => `<li style="--c:var(--warn)">${esc(x)}</li>`).join('')}</ul></div>`
       : j.spec?.crash && j.outcome === 'pass' ? `<div class="section"><div class="h">Recovery</div><ul class="lines"><li style="--c:var(--ok)"><span class="k">self</span>panic=10 rebooted the Mac and the one-shot fell back to its known-good kernel. No reset or human needed.</li></ul></div>` : ''}
     ${serious.length ? `<div class="section"><div class="h">Kernel events</div><ul class="lines">${serious.map(e => `<li style="--c:var(--bad)"><span class="k">${esc(e.kind)} · ${esc(e.source)}</span>${esc(e.line)}</li>`).join('')}</ul></div>` : ''}
+    ${omtSection(j)}
     ${r.new_error_lines?.length ? `<div class="section"><div class="h">New kernel warnings vs baseline <span class="muted" style="font-weight:400">${r.new_error_lines.length}</span></div>
       <ul class="lines">${r.new_error_lines.slice(0, 60).map(l => `<li style="--c:var(--warn)">${esc(l)}</li>`).join('')}</ul></div>` : ''}
     ${r.booted ? `<div class="section"><div class="h">Boot</div><dl class="kv"><dt>kernel</dt><dd>${esc(r.boot_kernel)}</dd><dt>up in</dt><dd>${dur(r.boot_seconds)}</dd>${r.logs?.length ? `<dt>logs</dt><dd>${r.logs.length} files</dd>` : ''}</dl></div>` : ''}

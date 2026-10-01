@@ -68,11 +68,12 @@ func serveMCP(ctx context.Context) error {
 		Scripts        []string `json:"scripts,omitempty" jsonschema:"local paths of shell scripts to run as tests (as root); write outputs to $MACLAB_OUT"`
 		GUIScripts     []string `json:"gui_scripts,omitempty" jsonschema:"local paths of shell scripts to run in the Wayland session"`
 		BootTimeoutSec int      `json:"boot_timeout_sec,omitempty"`
+		Publish        bool     `json:"publish,omitempty" jsonschema:"publish the omarchy-m-test report to omarchy-m-testing.org; only runs on the Mac's known-good kernel qualify"`
 		WaitSec        int      `json:"wait_sec,omitempty" jsonschema:"wait up to this long for the result (max 900); 0 returns once queued"`
 	}
 	mcp.AddTool(s, &mcp.Tool{Name: "lab_run", Description: "Boot a kernel on a Mac once and run tests. Give source (a GitHub URL) to build it first, or a kernel artifact. Returns the job; use lab_wait for the result."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, a runArg) (*mcp.CallToolResult, any, error) {
-			spec := api.JobSpec{Device: a.Device, Kernel: a.KernelSHA256, Source: a.Source, Cmdline: a.Cmdline, BootTimeoutSec: a.BootTimeoutSec, Holder: who}
+			spec := api.JobSpec{Device: a.Device, Kernel: a.KernelSHA256, Source: a.Source, Cmdline: a.Cmdline, BootTimeoutSec: a.BootTimeoutSec, Holder: who, Publish: a.Publish}
 			if a.KernelPath != "" {
 				sha, err := c.Upload(ctx, a.KernelPath)
 				if err != nil {
@@ -106,6 +107,14 @@ func serveMCP(ctx context.Context) error {
 				}
 			}
 			return submitAndWait(ctx, c, spec, a.WaitSec, text)
+		})
+
+	mcp.AddTool(s, &mcp.Tool{Name: "lab_publish", Description: "Upload a finished job's omarchy-m-test report to omarchy-m-testing.org. Only runs on the Mac's known-good (packaged) kernel qualify; lab kernels are refused because the site would file them under the wrong kernel."},
+		func(ctx context.Context, _ *mcp.CallToolRequest, a struct {
+			JobID string `json:"job_id"`
+		}) (*mcp.CallToolResult, any, error) {
+			url, err := c.Publish(ctx, a.JobID)
+			return text(url), nil, err
 		})
 
 	type waitDev struct {

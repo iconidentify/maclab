@@ -188,6 +188,15 @@ func (c *Client) Wait(ctx context.Context, id string, timeout time.Duration) (*a
 	return &out, c.do(ctx, "GET", fmt.Sprintf("/api/jobs/%s/wait?timeout=%d", url.PathEscape(id), int(timeout.Seconds())), nil, &out)
 }
 
+// Publish uploads a job's omarchy-m-test report and returns its page.
+func (c *Client) Publish(ctx context.Context, id string) (string, error) {
+	var out struct {
+		ReportURL string `json:"report_url"`
+	}
+	err := c.do(ctx, "POST", "/api/jobs/"+url.PathEscape(id)+"/publish", nil, &out)
+	return out.ReportURL, err
+}
+
 func (c *Client) Cancel(ctx context.Context, id string) (string, error) {
 	var out string
 	return out, c.do(ctx, "POST", "/api/jobs/"+url.PathEscape(id)+"/cancel", nil, &out)

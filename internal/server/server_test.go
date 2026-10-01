@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -644,5 +645,58 @@ func TestShortQuietSpellDuringTest(t *testing.T) {
 	l.expect(j, api.OutcomePass)
 	if len(j.Result.Recovery) != 0 {
 		t.Fatalf("recovery %v", j.Result.Recovery)
+	}
+}
+
+func TestOmarchyMTest(t *testing.T) {
+	l := newLab(t, true)
+	var posts []string
+	var mu sync.Mutex
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		posts = append(posts, string(b))
+		n := len(posts)
+		mu.Unlock()
+		w.WriteHeader(201)
+		fmt.Fprintf(w, `{"id":"r%d","report_url":"https://site/reports/r%d","deletion_url":"https://site/del/r%d?token=x","tester":false}`, n, n, n)
+	}))
+	defer site.Close()
+	l.s.cfg.OMT, l.s.cfg.OMTSite, l.s.cfg.OMTPublish = true, site.URL, true
+	l.waitDevice(func(d api.Device) bool { return d.Facts.AgentVersion != "" })
+
+	// The baseline runs it on the known-good kernel, keeps it as the reference and publishes it.
+	l.baseline()
+	jobs, _ := l.s.store.jobs("sim-mac", 1, false)
+	base := jobs[0]
+	if o := base.Result.OMT; o == nil || !o.KnownGood || o.Pass != 2 || o.Fail != 1 || o.Skip != 1 || o.Published != "https://site/reports/r1" {
+		t.Fatalf("baseline omt %+v", base.Result.OMT)
+	}
+	if len(posts) != 1 || !strings.Contains(posts[0], `"kernel":"`+agent.SimKnownGood+`"`) {
+		t.Fatalf("site got %d posts: %v", len(posts), posts)
+	}
+	if _, err := os.Stat(filepath.Join(l.s.jobDir(base.ID), "omt-published.json")); err != nil {
+		t.Fatal("the deletion link was not kept with the job")
+	}
+
+	// A good lab kernel: same results, nothing regressed, not published.
+	j := l.run(api.JobSpec{Kernel: l.artifact("krel=7.2-ok behavior=ok")})
+	l.expect(j, api.OutcomePass)
+	if o := j.Result.OMT; o == nil || o.KnownGood || len(o.Regressions) != 0 || len(o.LabBoot) != 1 || o.Published != "" || !strings.Contains(o.ComparedTo, base.ID) {
+		t.Fatalf("good kernel omt %+v", j.Result.OMT)
+	}
+
+	// A lab kernel that breaks Wi-Fi fails the job and names the check.
+	j = l.run(api.JobSpec{Kernel: l.artifact("krel=7.2-bad behavior=omt-regress")})
+	l.expect(j, api.OutcomeTestsFailed)
+	if o := j.Result.OMT; o == nil || len(o.Regressions) != 1 || o.Regressions[0].ID != "wifi.connected" {
+		t.Fatalf("regressed omt %+v", j.Result.OMT)
+	}
+	// And it can't be published: the site would file it under the packaged kernel.
+	if r, body := l.get("POST", "/api/jobs/"+j.ID+"/publish"); r.StatusCode != 409 || !strings.Contains(body, "lab kernel") {
+		t.Fatalf("publish of a lab kernel run: %s %s", r.Status, body)
+	}
+	if len(posts) != 1 {
+		t.Fatalf("site got %d posts, want 1", len(posts))
 	}
 }
