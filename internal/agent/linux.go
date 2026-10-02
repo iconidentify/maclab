@@ -30,8 +30,11 @@ type KnownGood struct {
 	// (e.g. /@/boot-test/... on the btrfs root while /boot is ext4).
 	RootUUID string `json:"root_uuid,omitempty"`
 	RootFS   string `json:"root_fs,omitempty"`
-	// Where setup decided to stage test kernels (default /boot/maclab).
+	// Where setup decided to stage test kernels (default /boot/maclab;
+	// <esp>/maclab under Limine).
 	StageDir string `json:"stage_dir,omitempty"`
+	// The loader setup found: "limine", or "" for GRUB (older records).
+	Loader string `json:"loader,omitempty"`
 }
 
 type Linux struct {
@@ -104,8 +107,8 @@ func (l *Linux) Facts() api.Facts {
 	f.PanicTimeout, _ = strconv.Atoi(readTrim("/proc/sys/kernel/panic"))
 	f.Problems = l.Preflight()
 	f.PreflightOK = len(f.Problems) == 0
-	if g, err := detectGrub(); err == nil && g != nil {
-		f.Bootloader = "grub"
+	if b, err := detectBootloader(); err == nil {
+		f.Bootloader = b.name()
 	}
 	return f
 }
@@ -127,16 +130,25 @@ func (l *Linux) Preflight() []string {
 	if os.Geteuid() != 0 {
 		p = append(p, "lab-agent is not running as root")
 	}
-	for _, bin := range []string{"grub-editenv", "findmnt", "tar", "depmod", "journalctl"} {
-		if _, err := exec.LookPath(bin); err != nil {
-			p = append(p, "missing "+bin)
-		}
-	}
-	g, err := detectGrub()
+	bins := []string{"findmnt", "tar", "depmod", "journalctl"}
+	minFree := uint64(300 << 20)
+	b, err := detectBootloader()
 	if err != nil {
 		p = append(p, "bootloader: "+err.Error())
 	} else {
-		p = append(p, g.hookProblems()...)
+		p = append(p, b.problems()...)
+		switch b.(type) {
+		case *grubLayout:
+			bins = append(bins, "grub-editenv")
+		case *limineLayout:
+			bins = append(bins, "chattr", "objcopy")
+			minFree = limineMinFree
+		}
+	}
+	for _, bin := range bins {
+		if _, err := exec.LookPath(bin); err != nil {
+			p = append(p, "missing "+bin)
+		}
 	}
 	if _, err := exec.LookPath("mkinitcpio"); err != nil {
 		if _, err := exec.LookPath("dracut"); err != nil {
@@ -157,8 +169,8 @@ func (l *Linux) Preflight() []string {
 	if _, err := os.Stat(probe); err != nil {
 		probe = filepath.Dir(probe)
 	}
-	if syscall.Statfs(probe, &st) == nil && st.Bavail*uint64(st.Bsize) < 300<<20 {
-		p = append(p, "less than 300 MB free where test kernels are staged ("+stage+")")
+	if syscall.Statfs(probe, &st) == nil && st.Bavail*uint64(st.Bsize) < minFree {
+		p = append(p, fmt.Sprintf("less than %d MB free where test kernels are staged (%s)", minFree>>20, stage))
 	}
 	return p
 }
@@ -205,11 +217,11 @@ func (l *Linux) Crash(mode string) error {
 }
 
 func (l *Linux) BootOnce(entry string) error {
-	g, err := detectGrub()
+	b, err := detectBootloader()
 	if err != nil {
 		return err
 	}
-	return g.arm(entry)
+	return b.arm(entry)
 }
 
 func (l *Linux) Collect(ctx context.Context, boot, outDir string) error {

@@ -23,11 +23,11 @@ func (l *Linux) Stage(ctx context.Context, job string, a api.StageArgs, fetch Fe
 	if strings.ContainsAny(job, "/. ") || job == "" {
 		return res, fmt.Errorf("bad job id %q", job)
 	}
-	g, err := detectGrub()
+	b, err := detectBootloader()
 	if err != nil {
 		return res, err
 	}
-	if p := g.hookProblems(); len(p) > 0 {
+	if p := b.problems(); len(p) > 0 {
 		return res, fmt.Errorf("one-shot hook not ready: %s", strings.Join(p, "; "))
 	}
 	kg, err := l.knownGood()
@@ -38,6 +38,10 @@ func (l *Linux) Stage(ctx context.Context, job string, a api.StageArgs, fetch Fe
 	if err := os.MkdirAll(bootDir, 0o755); err != nil {
 		return res, err
 	}
+	if lim, ok := b.(*limineLayout); ok {
+		return l.stageLimine(ctx, job, a, kg, lim, bootDir, fetch)
+	}
+	g := b.(*grubLayout)
 
 	linux, initrd := kg.GrubLinux, kg.GrubInitrd
 	uuid, fstype := g.Boot.UUID, g.Boot.FSType
@@ -46,7 +50,9 @@ func (l *Linux) Stage(ctx context.Context, job string, a api.StageArgs, fetch Fe
 	}
 	krel := kg.Kernel
 	if a.Artifact != "" {
-		krel, err = l.install(ctx, job, a.Artifact, bootDir, fetch)
+		krel, err = l.install(ctx, job, a.Artifact, fetch, func(krel, image string) error {
+			return grubBootFiles(ctx, krel, image, bootDir)
+		})
 		if err != nil {
 			l.removeJob(job)
 			return res, err
@@ -66,6 +72,37 @@ func (l *Linux) Stage(ctx context.Context, job string, a api.StageArgs, fetch Fe
 		return res, err
 	}
 	if err := g.writeEntries(); err != nil {
+		return res, err
+	}
+	return api.StageResult{KernelRelease: krel, Entry: entryPrefix + job, Cmdline: cmdline}, nil
+}
+
+// stageLimine stages a job as a UKI on the ESP and lists it in limine.conf.
+// Without an artifact it boots the known-good kernel through the one-shot.
+func (l *Linux) stageLimine(ctx context.Context, job string, a api.StageArgs, kg *KnownGood, lim *limineLayout, bootDir string, fetch Fetcher) (api.StageResult, error) {
+	var res api.StageResult
+	cmdline := testCmdline(kg.Cmdline, a, job)
+	uki := filepath.Join(bootDir, "uki.efi")
+	krel := kg.Kernel
+	var err error
+	if a.Artifact != "" {
+		krel, err = l.install(ctx, job, a.Artifact, fetch, func(krel, image string) error {
+			return writeUKI(ctx, krel, image, cmdline, uki)
+		})
+	} else {
+		err = writeUKI(ctx, krel, filepath.Join("/usr/lib/modules", krel, "vmlinuz"), cmdline, uki)
+	}
+	if err != nil {
+		l.removeJob(job)
+		lim.writeEntries()
+		return res, err
+	}
+	title := fmt.Sprintf("maclab %s: %s", job, krel)
+	os.WriteFile(filepath.Join(bootDir, "krel"), []byte(krel), 0o644)
+	if err := os.WriteFile(filepath.Join(bootDir, limineEntry), []byte(lim.entryText(job, title)), 0o644); err != nil {
+		return res, err
+	}
+	if err := lim.writeEntries(); err != nil {
 		return res, err
 	}
 	return api.StageResult{KernelRelease: krel, Entry: entryPrefix + job, Cmdline: cmdline}, nil
@@ -94,7 +131,9 @@ func testCmdline(base string, a api.StageArgs, job string) string {
 	return strings.Join(append(out, "maclab.job="+job), " ")
 }
 
-func (l *Linux) install(ctx context.Context, job, sha, bootDir string, fetch Fetcher) (string, error) {
+// install puts an artifact's modules in place and hands its kernel image to
+// boot, which writes the loader's boot files while the image still exists.
+func (l *Linux) install(ctx context.Context, job, sha string, fetch Fetcher, boot func(krel, image string) error) (string, error) {
 	work := l.jobDir(job)
 	os.RemoveAll(work)
 	x := filepath.Join(work, "x")
@@ -166,8 +205,16 @@ func (l *Linux) install(ctx context.Context, job, sha, bootDir string, fetch Fet
 	if out, err := exec.CommandContext(ctx, "depmod", "-a", krel).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("depmod: %v: %s", err, out)
 	}
+	if err := boot(krel, image); err != nil {
+		return "", err
+	}
+	return krel, nil
+}
+
+// grubBootFiles copies the kernel next to its entry and builds its initramfs.
+func grubBootFiles(ctx context.Context, krel, image, bootDir string) error {
 	if out, err := exec.Command("cp", image, filepath.Join(bootDir, "vmlinuz")).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("copy image: %v: %s", err, out)
+		return fmt.Errorf("copy image: %v: %s", err, out)
 	}
 	ictx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
@@ -179,9 +226,9 @@ func (l *Linux) install(ctx context.Context, job, sha, bootDir string, fetch Fet
 		cmd = exec.CommandContext(ictx, "dracut", "--force", "--kver", krel, initrd)
 	}
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("initramfs: %v: %s", err, lastLines(string(out), 15))
+		return fmt.Errorf("initramfs: %v: %s", err, lastLines(string(out), 15))
 	}
-	return krel, nil
+	return nil
 }
 
 func lastLines(s string, n int) string {
@@ -209,7 +256,7 @@ func (l *Linux) removeJob(job string) error {
 }
 
 func (l *Linux) Cleanup(job string, all bool) error {
-	g, err := detectGrub()
+	g, err := detectBootloader()
 	if err != nil {
 		return err
 	}

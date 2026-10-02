@@ -26,7 +26,7 @@ const (
 
 // Boot progress markers, only meaningful on serial.
 const (
-	MarkFirmware  = "firmware"  // m1n1 / U-Boot / GRUB output
+	MarkFirmware  = "firmware"  // m1n1 / U-Boot / GRUB / Limine output
 	MarkKernel    = "kernel"    // kernel has started printing
 	MarkInit      = "init"      // handed off to userspace
 	MarkUserspace = "userspace" // systemd reached a login prompt
@@ -54,7 +54,7 @@ var markers = []rule{
 	{MarkUserspace, regexp.MustCompile(` login: |Reached target (Multi-User|Graphical Interface)`)},
 	{MarkInit, regexp.MustCompile(`Run /\S*init as init process|systemd\[1\]: `)},
 	{MarkKernel, regexp.MustCompile(`Booting Linux on physical CPU|Linux version \d`)},
-	{MarkFirmware, regexp.MustCompile(`m1n1|U-Boot|GNU GRUB|Welcome to GRUB`)},
+	{MarkFirmware, regexp.MustCompile(`m1n1|U-Boot|GNU GRUB|Welcome to GRUB|Limine`)},
 }
 
 // Classify returns the event kind for a kernel log line, or "".

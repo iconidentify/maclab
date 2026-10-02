@@ -55,26 +55,38 @@ func Setup(ctx context.Context, o SetupOptions) error {
 		return err
 	}
 
-	g, err := detectGrub()
+	b, err := detectBootloader()
 	if err != nil {
 		return err
 	}
-	say("bootloader: GRUB in %s, one-shot flag in %s (ESP %s)", g.Dir, g.EnvFile, g.ESP.UUID)
-	if err := g.installHook(); err != nil {
-		return fmt.Errorf("install one-shot hook: %w", err)
+	switch g := b.(type) {
+	case *grubLayout:
+		say("bootloader: GRUB in %s, one-shot flag in %s (ESP %s)", g.Dir, g.EnvFile, g.ESP.UUID)
+		if err := g.installHook(); err != nil {
+			return fmt.Errorf("install one-shot hook: %w", err)
+		}
+		say("installed one-shot hook in %s/custom.cfg (backup: custom.cfg.pre-maclab)", g.Dir)
+	case *limineLayout:
+		say("bootloader: Limine (%s), menu %s, one-shot via LoaderEntryOneShot", g.Loader, g.Conf)
+		if g.VarFile != "" {
+			say("U-Boot keeps EFI variables in RAM; the lab persists them to %s (backup: %s.pre-maclab)", g.VarFile, filepath.Base(g.VarFile))
+		}
+		if err := g.install(); err != nil {
+			return fmt.Errorf("prepare Limine staging: %w", err)
+		}
+		say("test kernels are staged as UKIs in %s and listed at the end of %s", g.Stage, filepath.Base(g.Conf))
 	}
-	say("installed one-shot hook in %s/custom.cfg (backup: custom.cfg.pre-maclab)", g.Dir)
 
 	_, kernel, cmdline := l.Identity()
 	if tag := jobTag(cmdline); tag != "" {
 		return fmt.Errorf("running a lab kernel (job %s); reboot into your normal kernel before setup", tag)
 	}
-	if err := recordKnownGood(l, g, kernel, cmdline); err != nil {
+	if err := recordKnownGood(l, b, kernel, cmdline); err != nil {
 		return err
 	}
 	say("known-good kernel: %s", kernel)
-	if s := stageDir(); s != defaultStage {
-		say("test kernels are staged in %s (/boot is short on space)", s)
+	if _, ok := b.(*grubLayout); ok && stageDir() != defaultStage {
+		say("test kernels are staged in %s (/boot is short on space)", stageDir())
 	}
 
 	if err := os.WriteFile(sysctlPath, []byte("# maclab: reboot 10s after a panic instead of hanging\nkernel.panic = 10\n"), 0o644); err != nil {
@@ -155,8 +167,8 @@ func Setup(ctx context.Context, o SetupOptions) error {
 	return nil
 }
 
-func recordKnownGood(l *Linux, g *grubLayout, kernel, cmdline string) error {
-	kg, err := computeKnownGood(g, kernel, cmdline)
+func recordKnownGood(l *Linux, bl bootloader, kernel, cmdline string) error {
+	kg, err := computeKnownGood(bl, kernel, cmdline)
 	if err != nil {
 		return err
 	}
@@ -166,12 +178,12 @@ func recordKnownGood(l *Linux, g *grubLayout, kernel, cmdline string) error {
 
 // DescribeKnownGood shows what setup would record, without changing anything.
 func DescribeKnownGood() (string, error) {
-	g, err := detectGrub()
+	bl, err := detectBootloader()
 	if err != nil {
 		return "", err
 	}
 	_, kernel, cmdline := (&Linux{}).Identity()
-	kg, err := computeKnownGood(g, kernel, cmdline)
+	kg, err := computeKnownGood(bl, kernel, cmdline)
 	if err != nil {
 		return "", err
 	}
@@ -179,7 +191,11 @@ func DescribeKnownGood() (string, error) {
 	return string(b), nil
 }
 
-func computeKnownGood(g *grubLayout, kernel, cmdline string) (*KnownGood, error) {
+func computeKnownGood(b bootloader, kernel, cmdline string) (*KnownGood, error) {
+	if lim, ok := b.(*limineLayout); ok {
+		return limineKnownGood(lim, kernel, cmdline)
+	}
+	g := b.(*grubLayout)
 	var bootImage string
 	for _, f := range strings.Fields(cmdline) {
 		if v, ok := strings.CutPrefix(f, "BOOT_IMAGE="); ok {
@@ -213,6 +229,19 @@ func computeKnownGood(g *grubLayout, kernel, cmdline string) (*KnownGood, error)
 	}
 	kg.StageDir = chooseStage()
 	return &kg, nil
+}
+
+// limineKnownGood records the running kernel. Its UKI is the menu's default,
+// which a Limine Mac boots whenever no one-shot is set; the lab only needs
+// its release (to build a baseline UKI) and its cmdline.
+func limineKnownGood(lim *limineLayout, kernel, cmdline string) (*KnownGood, error) {
+	if _, err := os.Stat(filepath.Join("/usr/lib/modules", kernel, "vmlinuz")); err != nil {
+		return nil, fmt.Errorf("running kernel %s has no /usr/lib/modules/%s/vmlinuz to build a baseline UKI from", kernel, kernel)
+	}
+	if strings.Contains(cmdline, "maclab.job=") {
+		return nil, fmt.Errorf("the running kernel is a lab kernel")
+	}
+	return &KnownGood{Kernel: kernel, Cmdline: cmdline, Loader: lim.name(), StageDir: lim.Stage}, nil
 }
 
 // chooseStage keeps test kernels on /boot when it has room, else on the root

@@ -185,7 +185,7 @@ func (r *jobRun) execute(ctx context.Context) (string, string) {
 	v.mu.Lock()
 	v.dirty = true
 	v.mu.Unlock()
-	r.ev("staged %s as GRUB entry %s", sr.KernelRelease, sr.Entry)
+	r.ev("staged %s as boot entry %s", sr.KernelRelease, sr.Entry)
 
 	r.state(api.JobBooting)
 	oldBoot := v.snapshot().BootID
@@ -445,7 +445,7 @@ func (r *jobRun) restore(ctx context.Context) error {
 		d = v.snapshot()
 		if d.Health.JobTag != "" {
 			v.setState(api.StateNew, "one-shot boot did not clear")
-			return fmt.Errorf("the one-shot did not clear: a normal reboot came back on lab entry %s. GRUB could not write the ESP env file; the Mac is out of the pool until this is fixed", d.Health.JobTag)
+			return fmt.Errorf("the one-shot did not clear: a normal reboot came back on lab entry %s. The bootloader did not clear the one-shot (GRUB's ESP env file, or Limine's LoaderEntryOneShot); the Mac is out of the pool until this is fixed", d.Health.JobTag)
 		}
 		r.ev("back on %s", d.Kernel)
 	}

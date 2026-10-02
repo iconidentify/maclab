@@ -26,8 +26,9 @@ import (
 
 // omtPackagingChecks look for the running kernel among the installed packages
 // and in /boot. A lab boot runs a kernel that is neither, so they fail for
-// every lab kernel and say nothing about it.
-var omtPackagingChecks = map[string]bool{"boot.files": true, "boot.kernel-package": true}
+// every lab kernel and say nothing about it. boot.chain runs Omarchy's boot
+// check, which wants the installed linux-aurora running (Limine Macs).
+var omtPackagingChecks = map[string]bool{"boot.files": true, "boot.kernel-package": true, "boot.chain": true}
 
 const (
 	omtTest     = "omarchy-m-test"

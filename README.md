@@ -25,13 +25,23 @@ AI agents get the same operations over MCP (`lab mcp`).
 
 1. **Stage.** The agent downloads the artifact, installs its modules under
    `/usr/lib/modules/<release>` (refusing any release it didn't install
-   itself), builds an initramfs, and writes a GRUB entry to
-   `/boot/grub/maclab.cfg`. The known-good kernel is never touched.
-2. **Boot once.** The agent sets `maclab_next=<entry>` in `maclab.env` on the
-   ESP and reboots. GRUB selects the entry and **clears the flag before
-   booting it**. Any reset afterwards, for any reason, lands on the
-   known-good kernel. (GRUB can't write `grubenv` on btrfs, so a plain
-   `grub-reboot` would never clear. That's why the flag lives on the FAT ESP.)
+   itself), and writes the boot files for the Mac's bootloader. The
+   known-good kernel is never touched.
+   - **GRUB:** an initramfs and an entry in `/boot/grub/maclab.cfg`.
+   - **Limine** (Omarchy on Apple Silicon: U-Boot, then Limine, then a UKI on
+     the ESP): a unified kernel image in `<esp>/maclab/<job>/uki.efi`, listed in
+     a marked block at the end of `limine.conf`. Limine reads only FAT, so the
+     ESP needs about 120 MB free.
+2. **Boot once.** The agent arms a one-shot and reboots. The bootloader
+   **clears it before booting the entry**, so any reset afterwards, for any
+   reason, lands on the known-good kernel.
+   - **GRUB:** `maclab_next=<entry>` in `maclab.env` on the ESP. GRUB can't
+     write `grubenv` on btrfs, so a plain `grub-reboot` would never clear;
+     that's why the flag lives on the FAT ESP.
+   - **Limine:** the Boot Loader Interface variable `LoaderEntryOneShot`, which
+     Limine deletes as it reads it. Apple Silicon's U-Boot keeps EFI variables
+     in RAM at runtime, so the agent writes U-Boot's store (`VarToFile`) to the
+     file U-Boot loads them from (`ubootefi.var` on the ESP).
 3. **Watch.** labd waits for a check-in from the new boot. The boot is tagged
    `maclab.job=<id>` on the kernel command line, so labd can tell "booted the
    test kernel" from "fell back". On Macs with an OOB controller, labd also
@@ -98,8 +108,8 @@ sudo ./lab-agent setup --server http://<labd-host>:7770 --token enr_... --gui-us
 
 `setup` makes these changes. Each one is idempotent and backed up:
 
-- Appends the one-shot hook to `/boot/grub/custom.cfg` (backup: `custom.cfg.pre-maclab`).
-- Creates `maclab.env` on the ESP.
+- GRUB: appends the one-shot hook to `/boot/grub/custom.cfg` (backup: `custom.cfg.pre-maclab`) and creates `maclab.env` on the ESP.
+- Limine: creates `<esp>/maclab/`, adds the (empty) maclab block to `limine.conf`, and keeps a copy of U-Boot's `ubootefi.var` as `ubootefi.var.pre-maclab`.
 - Records the running kernel as known-good.
 - Sets `kernel.panic = 10`.
 - Arms the hardware watchdog (`RuntimeWatchdogSec=30s`).
