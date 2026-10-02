@@ -61,16 +61,18 @@ type Agent struct {
 	http *http.Client
 	log  *log.Logger
 
-	repMu     sync.Mutex // one report in flight at a time
-	mu        sync.Mutex
-	seen      map[string]bool
-	running   map[string]bool
-	results   []api.CommandResult
-	events    []api.KernelEvent
-	sentFacts bool
-	after     []func() // actions to run once pending results reach labd
-	wake      chan struct{}
-	life      context.Context // commands outlive the poll that delivered them
+	repMu             sync.Mutex // one report in flight at a time
+	mu                sync.Mutex
+	seen              map[string]bool
+	running           map[string]bool
+	results           []api.CommandResult
+	events            []api.KernelEvent
+	factsRevision     uint64
+	sentFactsRevision uint64
+	lastFacts         time.Time
+	after             []func() // actions to run once pending results reach labd
+	wake              chan struct{}
+	life              context.Context // commands outlive the poll that delivered them
 }
 
 func New(cfg *Config, sys System, logger *log.Logger) *Agent {
@@ -187,22 +189,29 @@ func (a *Agent) poll(ctx context.Context) error {
 	bootID, kernel, cmdline := a.sys.Identity()
 	ci := api.Checkin{BootID: bootID, Kernel: kernel, Cmdline: cmdline, Health: a.sys.Health()}
 	a.mu.Lock()
-	if !a.sentFacts {
-		f := a.sys.Facts()
-		f.AgentVersion = Version
-		ci.Facts = &f
-	}
+	factsRevision := a.factsRevision
+	refreshFacts := a.lastFacts.IsZero() || a.sentFactsRevision != factsRevision || time.Since(a.lastFacts) >= time.Minute
 	for id := range a.running {
 		ci.Running = append(ci.Running, id)
 	}
 	a.mu.Unlock()
+	if refreshFacts {
+		f := a.sys.Facts()
+		f.AgentVersion = Version
+		ci.Facts = &f
+	}
 
 	var resp api.CheckinResponse
 	if err := postJSON(ctx, a.http, a.url("/api/agent/checkin?wait_ms=10000"), a.cfg.Secret, ci, &resp); err != nil {
 		return err
 	}
 	a.mu.Lock()
-	a.sentFacts = true
+	if ci.Facts != nil {
+		// Cleanup can finish while this request is in flight. Acknowledge
+		// only the revision sent, so that refresh is not lost.
+		a.sentFactsRevision = factsRevision
+		a.lastFacts = time.Now()
+	}
 	a.mu.Unlock()
 	for _, c := range resp.Commands {
 		a.start(a.life, c)
@@ -352,7 +361,12 @@ func (a *Agent) exec(ctx context.Context, c api.Command) (any, func(), error) {
 	case api.CmdCleanup:
 		var args api.CleanupArgs
 		_ = json.Unmarshal(c.Args, &args)
-		return nil, nil, a.sys.Cleanup(c.JobID, args.All)
+		err := a.sys.Cleanup(c.JobID, args.All)
+		// Even a partial cleanup can change free space and preflight.
+		a.mu.Lock()
+		a.factsRevision++
+		a.mu.Unlock()
+		return nil, nil, err
 	case api.CmdScreen:
 		var args api.ScreenArgs
 		_ = json.Unmarshal(c.Args, &args)
