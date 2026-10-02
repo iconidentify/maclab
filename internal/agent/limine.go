@@ -230,11 +230,21 @@ func writeUKI(ctx context.Context, krel, image, cmdline, out string) error {
 	defer cancel()
 	tmp := out + ".tmp"
 	os.Remove(tmp)
-	cmdFile := filepath.Join(os.TempDir(), "maclab-cmdline-"+filepath.Base(filepath.Dir(out)))
-	if err := os.WriteFile(cmdFile, []byte(cmdline+"\n"), 0o644); err != nil {
+	// A fresh, exclusively created file: root must not follow a link that a
+	// local user planted at a predictable /tmp path.
+	f, err := os.CreateTemp("", "maclab-cmdline-*")
+	if err != nil {
 		return err
 	}
+	cmdFile := f.Name()
 	defer os.Remove(cmdFile)
+	_, werr := f.WriteString(cmdline + "\n")
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil {
+		return werr
+	}
 	var cmd *exec.Cmd
 	if _, err := exec.LookPath("mkinitcpio"); err == nil {
 		cmd = exec.CommandContext(ictx, "mkinitcpio", "-k", krel, "-U", tmp, "--kernelimage", image, "--cmdline", cmdFile)
