@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -861,5 +862,20 @@ func TestBaselinePublishesWhenKnownGoodChanges(t *testing.T) {
 	l.expect(j, api.OutcomePass)
 	if o := j.Result.OMT; o == nil || o.Published != "https://site/r/1" {
 		t.Fatalf("baseline after a kernel change was not published: %+v", j.Result.OMT)
+	}
+}
+
+func TestResetRespectsLease(t *testing.T) {
+	l := newLab(t, true)
+	l.baseline()
+	v := l.s.dev("sim-mac")
+	v.mu.Lock()
+	v.d.Lease = &api.Lease{Holder: "connor (homework)", Expires: time.Now().Add(time.Hour)}
+	v.mu.Unlock()
+	if r, body := l.get("POST", "/api/devices/sim-mac/reset?by=some-agent"); r.StatusCode != 409 || !strings.Contains(body, "connor (homework)") {
+		t.Fatalf("reset by a non-holder: %s %s", r.Status, body)
+	}
+	if r, _ := l.get("POST", "/api/devices/sim-mac/reset?by="+url.QueryEscape("connor (homework)")); r.StatusCode != 200 {
+		t.Fatalf("reset by the holder: %s", r.Status)
 	}
 }

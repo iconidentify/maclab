@@ -749,15 +749,22 @@ func (s *Server) hReset(w http.ResponseWriter, r *http.Request) {
 	if v == nil {
 		return
 	}
+	by := r.URL.Query().Get("by")
 	v.mu.Lock()
 	busy := v.d.State == api.StateBusy || v.d.State == api.StateRecovering
+	lease := v.d.Lease
 	v.mu.Unlock()
 	if busy {
 		httpErr(w, 409, "%s is busy; cancel its job instead", v.d.Name)
 		return
 	}
+	// A reset reboots the Mac, so a lease fences it like a job.
+	if lease != nil && time.Now().Before(lease.Expires) && lease.Holder != by {
+		httpErr(w, 409, "%s is leased by %s until %s; only the lease holder can reset it", v.d.Name, lease.Holder, lease.Expires.Format(time.DateTime))
+		return
+	}
 	go func() {
-		steps, ok := v.ladder(s.ctx, "reset requested by "+r.URL.Query().Get("by"), s.cfg.BootTimeout, true)
+		steps, ok := v.ladder(s.ctx, "reset requested by "+by, s.cfg.BootTimeout, true)
 		s.log.Printf("%s: manual reset: ok=%v steps=%v", v.d.Name, ok, steps)
 	}()
 	w.Write([]byte("recovery started; watch `lab status " + v.d.Name + "`\n"))
