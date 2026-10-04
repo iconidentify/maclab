@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/iconidentify/maclab/internal/api"
 )
 
@@ -211,12 +213,13 @@ func (l *Linux) Crash(mode string) error {
 	if mode != "panic" {
 		return fmt.Errorf("unknown crash mode %q", mode)
 	}
-	exec.Command("sync").Run()
+	syncDisks() // a crash test checks recovery, not FAT's tolerance of the lab's unflushed writes
 	os.WriteFile("/proc/sys/kernel/sysrq", []byte("1"), 0)
 	return os.WriteFile("/proc/sysrq-trigger", []byte("c"), 0)
 }
 
 func (l *Linux) BootOnce(entry string) error {
+	defer syncDisks()
 	b, err := detectBootloader()
 	if err != nil {
 		return err
@@ -238,6 +241,16 @@ func (l *Linux) Collect(ctx context.Context, boot, outDir string) error {
 	run("boots.txt", "--list-boots", "--no-pager")
 	return nil
 }
+
+// syncDisks flushes every filesystem before a stage, cleanup or one-shot
+// reports back. The ESP is FAT, with no journal: a hard reset or a panic
+// within the writeback window (about 30 s) after the lab deletes a staged UKI
+// or rewrites limine.conf leaves corrupt directory entries and a zero-length
+// limine.conf, which stops the next boot at the bootloader. labd acts on a
+// command's result (rebooting, resetting, or moving on), so the result must
+// only go out once the change is on disk. sync(2) also covers GRUB's /boot and
+// U-Boot's variable file, whatever the layout.
+func syncDisks() { unix.Sync() }
 
 // guiEnv finds the GUI user's Wayland session so tests can drive Hyprland.
 func guiEnv(name string, wait time.Duration) (*user.User, []string, error) {

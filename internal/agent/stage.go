@@ -19,6 +19,7 @@ import (
 func (l *Linux) jobDir(job string) string { return filepath.Join(l.WorkDir, "jobs", job) }
 
 func (l *Linux) Stage(ctx context.Context, job string, a api.StageArgs, fetch Fetcher) (api.StageResult, error) {
+	defer syncDisks()
 	var res api.StageResult
 	if strings.ContainsAny(job, "/. ") || job == "" {
 		return res, fmt.Errorf("bad job id %q", job)
@@ -256,6 +257,7 @@ func (l *Linux) removeJob(job string) error {
 }
 
 func (l *Linux) Cleanup(job string, all bool) error {
+	defer syncDisks()
 	g, err := detectBootloader()
 	if err != nil {
 		return err
