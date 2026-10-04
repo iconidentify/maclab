@@ -171,7 +171,10 @@ func (l *Linux) Preflight() []string {
 	if _, err := os.Stat(probe); err != nil {
 		probe = filepath.Dir(probe)
 	}
-	if syscall.Statfs(probe, &st) == nil && st.Bavail*uint64(st.Bsize) < minFree {
+	// Test kernels already staged there are deleted before the next job stages
+	// (a job starts by cleaning up its Mac), so they count as free: otherwise
+	// one staged job would block queueing the next.
+	if syscall.Statfs(probe, &st) == nil && st.Bavail*uint64(st.Bsize)+dirSize(stage) < minFree {
 		p = append(p, fmt.Sprintf("less than %d MB free where test kernels are staged (%s)", minFree>>20, stage))
 	}
 	return p
@@ -255,6 +258,18 @@ func (l *Linux) Collect(ctx context.Context, boot, outDir string) error {
 		}
 	}
 	return nil
+}
+
+// dirSize is the total size of the regular files under dir.
+func dirSize(dir string) uint64 {
+	var n uint64
+	filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
+		if err == nil && info.Mode().IsRegular() {
+			n += uint64(info.Size())
+		}
+		return nil
+	})
+	return n
 }
 
 // syncDisks flushes every filesystem before a stage, cleanup or one-shot

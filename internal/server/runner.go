@@ -107,7 +107,6 @@ func (s *Server) runJob(ctx context.Context, v *dev, j *api.Job) {
 	v.mu.Lock()
 	v.d.ActiveJob = j.ID
 	v.setStateLocked(api.StateBusy, "job "+j.ID)
-	dirty := v.dirty
 	v.mu.Unlock()
 	r.started = time.Now()
 	r.serial0 = s.serialOffset(v.d.Name)
@@ -130,14 +129,14 @@ func (s *Server) runJob(ctx context.Context, v *dev, j *api.Job) {
 			r.finish(api.OutcomeInfra, "could not restore the known-good kernel before the job: "+err.Error())
 			return
 		}
-		dirty = false
 	}
-	if dirty {
-		if err := v.call(ctx, api.CmdCleanup, "", api.CleanupArgs{All: true}, 2*time.Minute, nil); err == nil {
-			v.mu.Lock()
-			v.dirty = false
-			v.mu.Unlock()
-		}
+	// Remove whatever earlier jobs left staged, every time: the agent's preflight
+	// counts staged test kernels as free space, and labd's dirty flag doesn't
+	// survive a restart. Cleanup is cheap when there's nothing to do.
+	if err := v.call(ctx, api.CmdCleanup, "", api.CleanupArgs{All: true}, 2*time.Minute, nil); err == nil {
+		v.mu.Lock()
+		v.dirty = false
+		v.mu.Unlock()
 	}
 
 	outcome, summary := r.execute(ctx)
