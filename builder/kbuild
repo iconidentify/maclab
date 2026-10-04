@@ -9,13 +9,38 @@ set -euo pipefail
 unset LOCALVERSION  # make appends this env var to the release; ours goes in the config
 C=/cache
 CCACHE_MAX=${CCACHE_MAX:-8G}
-KEEP_BUILDS=${KEEP_BUILDS:-2}
+KEEP_BUILDS=${KEEP_BUILDS:-3}
+NEED_GB=${NEED_GB:-12} # free space a build starts with: a full object tree is ~9.5 GB
 mkdir -p $C/git $C/build $C/ccache $C/tmp
 export CCACHE_DIR=$C/ccache CCACHE_COMPILERCHECK=content
 # ccache via its gcc wrappers: CC stays one word, which rustc needs as a linker.
 export PATH=/usr/lib/ccache:$PATH
 ccache -M "$CCACHE_MAX" >/dev/null
 step() { echo "==> $*"; echo "@@stage ${1%% *}"; }
+
+# Object trees, least recently used first (by their .last-used stamp), except this build's.
+lru_trees() {
+  for d in $C/build/*/; do
+    [ "$d" = "$O/" ] && continue
+    echo "$(stat -c %Y "$d.last-used" 2>/dev/null || echo 0) $d"
+  done | sort -n | cut -d' ' -f2
+}
+free_gb() { df -Pk $C | awk 'NR==2 { print int($4 / 1048576) }'; }
+
+# make_room frees space before a build, not after: a run of failed builds with new
+# configs (which never reach "tidy cache") once filled the volume mid-compile.
+make_room() {
+  local d
+  for d in $(lru_trees); do
+    [ "$(free_gb)" -ge "$NEED_GB" ] && return
+    echo "cache: $(free_gb) GB free, need $NEED_GB; removing the least recently used object tree $(basename "$d")"
+    rm -rf "$d"
+  done
+  if [ "$(free_gb)" -lt "$NEED_GB" ]; then
+    echo "cache: still $(free_gb) GB free; emptying ccache"
+    ccache -C >/dev/null
+  fi
+}
 
 step "fetch $URL $SHA"
 git -C $C/git rev-parse --git-dir >/dev/null 2>&1 || git init -q --bare $C/git
@@ -44,6 +69,7 @@ cfghash=$(sha256sum /io/config | cut -c1-12)
 O=$C/build/$cfghash
 mkdir -p "$O"
 touch "$O/.last-used"
+make_room
 cp /io/config "$O/.config"
 ./scripts/config --file "$O/.config" --set-str LOCALVERSION "$LABVER" -d LOCALVERSION_AUTO
 if [ -f rust-toolchain.toml ]; then export RUSTUP_TOOLCHAIN=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml); fi
@@ -85,7 +111,7 @@ rm -rf "$P"
 echo "artifact: $(du -h /io/kernel.tar.zst | cut -f1)"
 
 step "tidy cache"
-ls -1dt $C/build/*/ 2>/dev/null | tail -n +$((KEEP_BUILDS + 1)) | xargs -r rm -rf
+lru_trees | head -n -$((KEEP_BUILDS - 1)) | xargs -r rm -rf
 for r in $(git -C $C/git for-each-ref --format='%(refname)' refs/lab/ | head -n -8); do git -C $C/git update-ref -d "$r"; done
 if [ $(( RANDOM % 5 )) -eq 0 ]; then git -C $C/git gc -q --prune=now; fi
 ccache -s | grep -E -i "cache size|hit rate" || true
