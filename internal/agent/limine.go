@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"golang.org/x/sys/unix"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -134,7 +135,40 @@ var reMaclabBlock = regexp.MustCompile(`(?s)\n?` + regexp.QuoteMeta(limineBegin)
 
 // writeEntries rewrites the marked block at the end of limine.conf from every
 // staged job, leaving everything else in the file as it was.
+// bootPartitionLock is the lock limine-snapper-sync, limine-entry-tool and the
+// rest of Omarchy's Limine tooling take (/usr/lib/limine/limine-mutex) before
+// they touch limine.conf or other files on the ESP. Its README asks every other
+// tool to take it too. Without it, a snapshot sync rewriting limine.conf could
+// interleave with ours and drop the lab's block, staged entry included.
+var bootPartitionLock = "/run/lock/boot-partition.lock"
+
+func lockBootPartition(timeout time.Duration) (func(), error) {
+	os.MkdirAll(filepath.Dir(bootPartitionLock), 0o755)
+	f, err := os.OpenFile(bootPartitionLock, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(timeout)
+	for unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB) != nil {
+		if time.Now().After(deadline) {
+			f.Close()
+			return nil, fmt.Errorf("%s has been held by another tool (limine-snapper-sync?) for over %s", bootPartitionLock, timeout)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return func() { unix.Flock(int(f.Fd()), unix.LOCK_UN); f.Close() }, nil
+}
+
 func (l *limineLayout) writeEntries() error {
+	unlock, err := lockBootPartition(time.Minute)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return l.writeEntriesLocked()
+}
+
+func (l *limineLayout) writeEntriesLocked() error {
 	conf, err := os.ReadFile(l.Conf)
 	if err != nil {
 		return err
@@ -165,8 +199,13 @@ func (l *limineLayout) arm(entry string) error {
 	if _, err := os.Stat(filepath.Join(l.Stage, job, "uki.efi")); err != nil {
 		return fmt.Errorf("entry %s is not staged", entry)
 	}
-	// limine-update rewrites limine.conf on kernel updates: put the block back.
-	if err := l.writeEntries(); err != nil {
+	unlock, err := lockBootPartition(time.Minute)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	// limine-update and snapshot syncs rewrite limine.conf: put the block back.
+	if err := l.writeEntriesLocked(); err != nil {
 		return err
 	}
 	conf, _ := os.ReadFile(l.Conf)
@@ -202,6 +241,11 @@ func (l *limineLayout) disarm() error {
 	if l.armed() == "" {
 		return nil
 	}
+	unlock, err := lockBootPartition(time.Minute)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if err := deleteEfivar("LoaderEntryOneShot", bliGUID); err != nil {
 		return err
 	}
