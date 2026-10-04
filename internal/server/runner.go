@@ -178,7 +178,8 @@ func (r *jobRun) execute(ctx context.Context) (string, string) {
 	}
 	r.ev("staging %s", what)
 	d := v.snapshot()
-	args := api.StageArgs{Artifact: j.Spec.Kernel, Cmdline: j.Spec.Cmdline, Serial: d.OOB != nil}
+	args := api.StageArgs{Artifact: j.Spec.Kernel, Cmdline: j.Spec.Cmdline, Serial: d.OOB != nil,
+		CmdlineBase: j.Spec.CmdlineBase, CmdlineStrip: j.Spec.CmdlineStrip}
 	if err := v.call(ctx, api.CmdStage, j.ID, args, 20*time.Minute, &sr); err != nil {
 		return api.OutcomeStageFailed, "staging failed: " + err.Error()
 	}
@@ -186,6 +187,9 @@ func (r *jobRun) execute(ctx context.Context) (string, string) {
 	v.dirty = true
 	v.mu.Unlock()
 	r.ev("staged %s as boot entry %s", sr.KernelRelease, sr.Entry)
+	if sr.Cmdline != "" {
+		r.ev("cmdline: %s", sr.Cmdline)
+	}
 
 	r.state(api.JobBooting)
 	oldBoot := v.snapshot().BootID
@@ -221,7 +225,7 @@ func (r *jobRun) execute(ctx context.Context) (string, string) {
 	r.bootID, r.bootedAt = d.BootID, time.Now()
 	secs := time.Since(t0).Seconds()
 	r.s.updateJob(j, func(j *api.Job) {
-		j.Result.Booted, j.Result.BootKernel, j.Result.BootSeconds = true, d.Kernel, secs
+		j.Result.Booted, j.Result.BootKernel, j.Result.BootSeconds, j.Result.BootCmdline = true, d.Kernel, secs, d.Cmdline
 	})
 	r.ev("booted %s in %.0fs", d.Kernel, secs)
 	r.capture("after-boot")
@@ -266,6 +270,11 @@ func (r *jobRun) execute(ctx context.Context) (string, string) {
 	r.capture("after-tests")
 	r.state(api.JobCollecting)
 	files := r.collect(ctx, "0")
+	if b, err := os.ReadFile(filepath.Join(r.s.jobDir(j.ID), "boot0", "systemd-analyze.txt")); err == nil {
+		if first, _, _ := strings.Cut(strings.TrimSpace(string(b)), "\n"); first != "" {
+			r.ev("systemd-analyze: %s", first)
+		}
+	}
 	var newLines []string
 	for _, f := range files {
 		if strings.HasSuffix(f, "/dmesg-errors.txt") {

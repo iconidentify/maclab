@@ -62,7 +62,9 @@ func serveMCP(ctx context.Context) error {
 		KernelPath       string   `json:"kernel_path,omitempty" jsonschema:"local path of a kernel artifact to upload; omit to reboot on the current kernel"`
 		KernelSHA256     string   `json:"kernel_sha256,omitempty" jsonschema:"sha256 of an artifact already uploaded"`
 		BuildID          string   `json:"build_id,omitempty" jsonschema:"boot the kernel of a finished build, e.g. the linux package of a lab_package build"`
-		Cmdline          string   `json:"cmdline,omitempty" jsonschema:"extra kernel command line arguments"`
+		Cmdline          string   `json:"cmdline,omitempty" jsonschema:"extra kernel command line arguments, appended to the base"`
+		CmdlineBase      string   `json:"cmdline_base,omitempty" jsonschema:"cmdline the test boot starts from: known-good (default), default (the distro's stock KERNEL_CMDLINE[default]), or a literal cmdline with root="`
+		CmdlineStrip     []string `json:"cmdline_strip,omitempty" jsonschema:"globs of base parameters to drop, e.g. asahi.* apple_t6030_display.*"`
 		Tests            []string `json:"tests,omitempty" jsonschema:"builtin tests: boot-health (always run), gui-smoke, gui-terminal"`
 		GUITests         []string `json:"gui_tests,omitempty" jsonschema:"builtin tests to run inside the GUI user's Hyprland session: gui-smoke, gui-terminal"`
 		Scripts          []string `json:"scripts,omitempty" jsonschema:"local paths of shell scripts to run as tests (as root); write outputs to $MACLAB_OUT"`
@@ -75,7 +77,8 @@ func serveMCP(ctx context.Context) error {
 	}
 	mcp.AddTool(s, &mcp.Tool{Name: "lab_run", Description: "Boot a kernel on a Mac once and run tests. Give source (a GitHub URL) to build it first, or a kernel artifact. Returns the job; use lab_wait for the result."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, a runArg) (*mcp.CallToolResult, any, error) {
-			spec := api.JobSpec{Device: a.Device, Kernel: a.KernelSHA256, Source: a.Source, Cmdline: a.Cmdline, BootTimeoutSec: a.BootTimeoutSec, Holder: who, Publish: a.Publish, OMTAllow: a.OMTAllow}
+			spec := api.JobSpec{Device: a.Device, Kernel: a.KernelSHA256, Source: a.Source, Cmdline: a.Cmdline, BootTimeoutSec: a.BootTimeoutSec, Holder: who, Publish: a.Publish, OMTAllow: a.OMTAllow,
+				CmdlineBase: a.CmdlineBase, CmdlineStrip: a.CmdlineStrip}
 			if a.KernelPath != "" {
 				sha, err := c.Upload(ctx, a.KernelPath)
 				if err != nil {

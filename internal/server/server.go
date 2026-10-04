@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -853,6 +854,19 @@ func (s *Server) Submit(spec api.JobSpec) (*api.Job, int, error) {
 		return nil, 400, fmt.Errorf("unknown crash mode %q", spec.Crash)
 	}
 	d := s.view(v)
+	if spec.CmdlineBase != "" || len(spec.CmdlineStrip) > 0 {
+		if spec.Baseline || spec.Crash != "" {
+			return nil, 400, errors.New("baseline and crash-test jobs boot the known-good cmdline; drop --cmdline-base/--cmdline-strip")
+		}
+		if !versionAtLeast(d.Facts.AgentVersion, "0.5.0") {
+			return nil, 409, fmt.Errorf("%s runs lab-agent %s, which ignores --cmdline-base/--cmdline-strip; update it to 0.5.0 or later", d.Name, orStr(d.Facts.AgentVersion, "(unknown)"))
+		}
+		for _, g := range spec.CmdlineStrip {
+			if _, err := path.Match(g, ""); err != nil || strings.TrimSpace(g) == "" {
+				return nil, 400, fmt.Errorf("--cmdline-strip pattern %q is not a valid glob", g)
+			}
+		}
+	}
 	if spec.Crash == "" {
 		has := false
 		for i, t := range spec.Tests {

@@ -166,8 +166,15 @@ type CommandResult struct {
 
 type StageArgs struct {
 	Artifact string `json:"artifact"` // sha256
-	Cmdline  string `json:"cmdline"`  // extra args appended to the known-good cmdline
+	Cmdline  string `json:"cmdline"`  // extra args appended to the base cmdline
 	Serial   bool   `json:"serial"`   // add the debug UART console
+	// CmdlineBase picks the cmdline a test boot starts from: "" or "known-good"
+	// (the known-good kernel's), "default" (the distro's stock cmdline, e.g.
+	// Limine's KERNEL_CMDLINE[default]), or a literal cmdline with root=.
+	CmdlineBase string `json:"cmdline_base,omitempty"`
+	// CmdlineStrip removes base parameters whose name (before "=") or whole
+	// text matches one of these globs, e.g. "asahi.*".
+	CmdlineStrip []string `json:"cmdline_strip,omitempty"`
 }
 
 type StageResult struct {
@@ -265,6 +272,8 @@ type JobSpec struct {
 	Source         string     `json:"source,omitempty"` // build this first: a GitHub/git URL of a repo, branch, commit or PR
 	Build          string     `json:"build,omitempty"`  // the build job that produced Kernel
 	Cmdline        string     `json:"cmdline,omitempty"`
+	CmdlineBase    string     `json:"cmdline_base,omitempty"`  // see StageArgs.CmdlineBase
+	CmdlineStrip   []string   `json:"cmdline_strip,omitempty"` // see StageArgs.CmdlineStrip
 	Tests          []TestSpec `json:"tests,omitempty"`
 	BootTimeoutSec int        `json:"boot_timeout_sec,omitempty"`
 	Crash          string     `json:"crash,omitempty"` // crash test mode, see CrashArgs
@@ -288,6 +297,7 @@ type JobEvent struct {
 type JobResult struct {
 	Booted        bool          `json:"booted"`
 	BootKernel    string        `json:"boot_kernel,omitempty"`
+	BootCmdline   string        `json:"boot_cmdline,omitempty"` // /proc/cmdline of the test boot
 	BootSeconds   float64       `json:"boot_seconds,omitempty"`
 	FellBack      bool          `json:"fell_back,omitempty"`
 	Recovery      []string      `json:"recovery,omitempty"` // ladder steps that were needed

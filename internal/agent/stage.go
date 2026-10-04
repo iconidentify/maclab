@@ -2,10 +2,13 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -66,7 +69,11 @@ func (l *Linux) Stage(ctx context.Context, job string, a api.StageArgs, fetch Fe
 		initrd = filepath.Join(filepath.Dir(linux), "initramfs.img")
 	}
 
-	cmdline := testCmdline(kg.Cmdline, a, job)
+	cmdline, err := stageCmdline(kg.Cmdline, stockCmdline, a, job)
+	if err != nil {
+		l.removeJob(job)
+		return res, err
+	}
 	title := fmt.Sprintf("maclab %s: %s", job, krel)
 	os.WriteFile(filepath.Join(bootDir, "krel"), []byte(krel), 0o644)
 	if err := os.WriteFile(filepath.Join(bootDir, "entry.cfg"), []byte(g.entryText(job, title, linux, initrd, cmdline, uuid, fstype)), 0o644); err != nil {
@@ -82,10 +89,12 @@ func (l *Linux) Stage(ctx context.Context, job string, a api.StageArgs, fetch Fe
 // Without an artifact it boots the known-good kernel through the one-shot.
 func (l *Linux) stageLimine(ctx context.Context, job string, a api.StageArgs, kg *KnownGood, lim *limineLayout, bootDir string, fetch Fetcher) (api.StageResult, error) {
 	var res api.StageResult
-	cmdline := testCmdline(kg.Cmdline, a, job)
+	cmdline, err := stageCmdline(kg.Cmdline, stockCmdline, a, job)
+	if err != nil {
+		return res, err
+	}
 	uki := filepath.Join(bootDir, "uki.efi")
 	krel := kg.Kernel
-	var err error
 	if a.Artifact != "" {
 		krel, err = l.install(ctx, job, a.Artifact, fetch, func(krel, image string) error {
 			return writeUKI(ctx, krel, image, cmdline, uki)
@@ -109,7 +118,78 @@ func (l *Linux) stageLimine(ctx context.Context, job string, a api.StageArgs, kg
 	return api.StageResult{KernelRelease: krel, Entry: entryPrefix + job, Cmdline: cmdline}, nil
 }
 
-// testCmdline starts from the known-good cmdline, makes boot verbose, makes
+// stageCmdline is the cmdline a test boot gets. It starts from a base: the
+// known-good kernel's cmdline, the distro's stock one ("default"), or a literal.
+// It removes the base parameters a.CmdlineStrip names, then adds the lab's own
+// (testCmdline). Proving a kernel needs none of a Mac's bring-up parameters is
+// "default", or the known-good base with those parameters stripped.
+func stageCmdline(knownGood string, stock func() (string, error), a api.StageArgs, job string) (string, error) {
+	base := knownGood
+	switch b := strings.TrimSpace(a.CmdlineBase); b {
+	case "", "known-good":
+	case "default":
+		s, err := stock()
+		if err != nil {
+			return "", err
+		}
+		base = s
+	default:
+		base = b
+	}
+	base = stripParams(base, a.CmdlineStrip)
+	if !hasParam(base, "root") {
+		return "", fmt.Errorf("the test cmdline would have no root= (base %q, strip %q)", a.CmdlineBase, a.CmdlineStrip)
+	}
+	return testCmdline(base, a, job), nil
+}
+
+// stripParams drops the parameters whose name (before "=") or whole text
+// matches one of the globs.
+func stripParams(cmdline string, globs []string) string {
+	var out []string
+	for _, f := range strings.Fields(cmdline) {
+		name, _, _ := strings.Cut(f, "=")
+		drop := false
+		for _, g := range globs {
+			if m, _ := path.Match(g, name); m {
+				drop = true
+			} else if m, _ := path.Match(g, f); m {
+				drop = true
+			}
+		}
+		if !drop {
+			out = append(out, f)
+		}
+	}
+	return strings.Join(out, " ")
+}
+
+func hasParam(cmdline, name string) bool {
+	for _, f := range strings.Fields(cmdline) {
+		if k, _, _ := strings.Cut(f, "="); k == name {
+			return true
+		}
+	}
+	return false
+}
+
+var reStockCmdline = regexp.MustCompile(`(?m)^\s*KERNEL_CMDLINE\[default\]=(["'])(.*)["']\s*$`)
+
+// stockCmdline is the distro's default cmdline for a kernel with no entry of
+// its own: KERNEL_CMDLINE[default] in /etc/default/limine on Omarchy.
+func stockCmdline() (string, error) {
+	b, err := os.ReadFile("/etc/default/limine")
+	if err != nil {
+		return "", fmt.Errorf("cmdline base \"default\" reads KERNEL_CMDLINE[default] from /etc/default/limine: %w", err)
+	}
+	m := reStockCmdline.FindSubmatch(b)
+	if m == nil {
+		return "", errors.New("no KERNEL_CMDLINE[default] in /etc/default/limine")
+	}
+	return string(m[2]), nil
+}
+
+// testCmdline starts from the base cmdline, makes boot verbose, makes
 // panics reboot, and tags the boot so labd can tell which entry came up.
 func testCmdline(base string, a api.StageArgs, job string) string {
 	var out []string

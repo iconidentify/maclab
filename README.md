@@ -57,6 +57,15 @@ AI agents get the same operations over MCP (`lab mcp`).
 6. **Restore.** The agent reboots to the known-good kernel, checks that the
    one-shot really cleared, and removes the staged kernel.
 
+A test boot's command line starts from the known-good kernel's. It drops `quiet`,
+`splash` and `loglevel=`, then adds `loglevel=7 panic=10`, the serial console and
+`maclab.job=<id>`. `lab run --cmdline-base default` starts from the distro's stock
+command line (`KERNEL_CMDLINE[default]` in `/etc/default/limine`) instead, to show a
+kernel needs no bring-up parameters. `--cmdline-base '<cmdline>'` takes a literal
+one. `--cmdline-strip 'asahi.* dcpext_*'` drops matching parameters, and `--cmdline`
+appends. The job records the staged and the booted command line. Test boots also
+keep `systemd-analyze` time, blame and critical-chain.
+
 Outcomes: `pass`, `tests_failed`, `booted_unhealthy`, `panicked`, `hung`,
 `boot_failed`, `stage_failed`, `infra_error`, `canceled`.
 

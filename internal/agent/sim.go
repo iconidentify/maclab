@@ -128,7 +128,11 @@ func (s *Sim) Stage(ctx context.Context, job string, a api.StageArgs, fetch Fetc
 			return api.StageResult{}, fmt.Errorf("artifact kernel release %s is the running kernel", e.krel)
 		}
 	}
-	e.cmdline = testCmdline(s.cmdline, a, job)
+	cmdline, err := stageCmdline(s.cmdline, func() (string, error) { return "root=UUID=sim rw quiet splash", nil }, a, job)
+	if err != nil {
+		return api.StageResult{}, err
+	}
+	e.cmdline = cmdline
 	s.mu.Lock()
 	s.staged[job] = e
 	s.mu.Unlock()

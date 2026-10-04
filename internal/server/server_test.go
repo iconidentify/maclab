@@ -710,3 +710,30 @@ func TestOmarchyMTest(t *testing.T) {
 		t.Fatalf("site got %d posts, want 1", len(posts))
 	}
 }
+
+func TestCmdlineBaseAndStrip(t *testing.T) {
+	l := newLab(t, true)
+	l.baseline()
+	j := l.run(api.JobSpec{Kernel: l.artifact("krel=7.2-ok behavior=ok"), CmdlineBase: "default", Cmdline: "extra=1"})
+	l.expect(j, api.OutcomePass)
+	c := j.Result.BootCmdline
+	if !strings.HasPrefix(c, "root=UUID=sim rw loglevel=7 panic=10") || strings.Contains(c, "quiet") || !strings.Contains(c, "extra=1") || !strings.Contains(c, "maclab.job="+j.ID) {
+		t.Fatalf("booted with %q", c)
+	}
+	var shown bool
+	for _, e := range j.Events {
+		shown = shown || strings.HasPrefix(e.Msg, "cmdline: root=UUID=sim rw")
+	}
+	if !shown {
+		t.Fatal("the job does not show the staged cmdline")
+	}
+	// A strip that would leave no root= fails the stage, not the boot.
+	j = l.run(api.JobSpec{Kernel: l.artifact("krel=7.2-ok2 behavior=ok"), CmdlineStrip: []string{"root"}})
+	l.expect(j, api.OutcomeStageFailed)
+	if _, code, err := l.s.Submit(api.JobSpec{Device: "sim-mac", Baseline: true, CmdlineBase: "default"}); err == nil || code != 400 {
+		t.Fatalf("baseline with a cmdline base: %d %v", code, err)
+	}
+	if _, code, err := l.s.Submit(api.JobSpec{Device: "sim-mac", CmdlineStrip: []string{"[bad"}}); err == nil || code != 400 {
+		t.Fatalf("bad glob: %d %v", code, err)
+	}
+}

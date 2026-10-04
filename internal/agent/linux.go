@@ -239,6 +239,21 @@ func (l *Linux) Collect(ctx context.Context, boot, outDir string) error {
 	run("kernel.txt", "-k", "-b", boot, "-o", "short-monotonic", "--no-pager")
 	run("dmesg-errors.txt", "-k", "-b", boot, "-p", "warning", "-o", "cat", "--no-pager")
 	run("boots.txt", "--list-boots", "--no-pager")
+	if boot == "0" {
+		// systemd-analyze only knows the running boot: how long firmware, loader,
+		// kernel, initrd and userspace took, and which units held boot up.
+		for name, args := range map[string][]string{
+			"systemd-analyze.txt":        {"time"},
+			"systemd-blame.txt":          {"blame", "--no-pager"},
+			"systemd-critical-chain.txt": {"critical-chain", "--no-pager"},
+		} {
+			out, err := exec.CommandContext(ctx, "systemd-analyze", args...).CombinedOutput()
+			if err != nil {
+				out = append(out, []byte("\n[systemd-analyze: "+err.Error()+"]\n")...)
+			}
+			os.WriteFile(filepath.Join(outDir, name), out, 0o644)
+		}
+	}
 	return nil
 }
 
