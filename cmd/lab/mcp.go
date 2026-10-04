@@ -262,13 +262,22 @@ func serveMCP(ctx context.Context) error {
 		})
 
 	type buildArg struct {
-		Source string `json:"source" jsonschema:"GitHub URL of a repo, branch, commit or pull request (or git URL#ref)"`
-		Device string `json:"device" jsonschema:"build with this Mac's running kernel config"`
-		Force  bool   `json:"force,omitempty"`
+		Source     string `json:"source" jsonschema:"GitHub URL of a repo, branch, commit or pull request (or git URL#ref)"`
+		Device     string `json:"device,omitempty" jsonschema:"build with this Mac's running kernel config"`
+		ConfigPath string `json:"config_path,omitempty" jsonschema:"or: local path of a .config to build with; the result boots on every Mac"`
+		Force      bool   `json:"force,omitempty"`
 	}
 	mcp.AddTool(s, &mcp.Tool{Name: "lab_build", Description: "Build a kernel from source without booting it. Identical builds (same commit and config) are reused. Returns the build; poll lab_build_status."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, a buildArg) (*mcp.CallToolResult, any, error) {
-			b, err := c.Build(ctx, api.BuildRequest{Source: a.Source, Device: a.Device, Force: a.Force})
+			req := api.BuildRequest{Source: a.Source, Device: a.Device, Force: a.Force}
+			if a.ConfigPath != "" {
+				sha, err := c.Upload(ctx, a.ConfigPath)
+				if err != nil {
+					return nil, nil, err
+				}
+				req.Config, req.ConfigName, req.Device = sha, filepath.Base(a.ConfigPath), ""
+			}
+			b, err := c.Build(ctx, req)
 			return text(b), nil, err
 		})
 	type packageArg struct {

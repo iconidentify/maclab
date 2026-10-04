@@ -27,7 +27,7 @@ const usage = `lab: run kernels and tests on Omarchy Macs
   lab enroll <name> [--label "MacBook Air M1, left desk"] [--model laptop|desktop]
   lab device <name> [--label ..] [--model ..] [--oob-url http://m3:7780 --oob-token ..] [--no-oob]
   lab baseline <device>               prove the one-shot boot works; required once per Mac
-  lab build <github-url> --device <mac>   build a kernel from a repo, branch, commit or PR URL (reused if built before)
+  lab build <github-url> --device <mac> | --config <file>   build a kernel from a repo, branch, commit or PR URL (reused if built before)
   lab package <recipe-dir> [--commit <github-url>] [--pkgrel 11.14] [-o dir]
                                       build release packages from a PKGBUILD recipe with makepkg, as the release machine does
   lab builds | lab build-log <build> [-f] | lab build-get <build> [-o dir]
@@ -187,6 +187,7 @@ func dispatch(ctx context.Context, c *client.Client, cmd string, args []string) 
 	case "run":
 		kernel := fs.String("kernel", "", "kernel artifact: a file to upload, or a sha256 already uploaded")
 		cmdline := fs.String("cmdline", "", "extra kernel arguments, appended to the base")
+		runConfig := fs.String("config", "", "with a source URL --kernel: build with this .config (file or uploaded sha256) instead of the Mac's own")
 		cmdlineBase := fs.String("cmdline-base", "", `cmdline the test boot starts from: known-good (default), "default" (the distro's stock KERNEL_CMDLINE[default]), or a literal cmdline with root=`)
 		cmdlineStrip := fs.String("cmdline-strip", "", `globs of base parameters to drop, space- or comma-separated, e.g. 'asahi.* apple_t6030_display.* dcpext_*'`)
 		bootTimeout := fs.Int("boot-timeout", 0, "seconds to wait for the Mac to come back (default 240)")
@@ -213,6 +214,13 @@ func dispatch(ctx context.Context, c *client.Client, cmd string, args []string) 
 		switch {
 		case isSource(*kernel):
 			spec.Source = *kernel
+			if *runConfig != "" {
+				sha, err := artifact(ctx, c, *runConfig)
+				if err != nil {
+					return err
+				}
+				spec.Config = sha
+			}
 		case reBuildID.MatchString(*kernel):
 			b, err := c.GetBuild(ctx, *kernel)
 			if err != nil {
@@ -249,13 +257,25 @@ func dispatch(ctx context.Context, c *client.Client, cmd string, args []string) 
 
 	case "build":
 		dev := fs.String("device", "", "build with this Mac's running config")
+		config := fs.String("config", "", "build with this .config (a file to upload, or an uploaded sha256) instead of a Mac's; one build boots on every Mac")
 		force := fs.Bool("force", false, "rebuild even if this exact kernel was built before")
 		noWait := fs.Bool("no-wait", false, "")
 		pos := parse(fs, args)
-		if err := need(pos, 1, "lab build <github-url> --device <mac>"); err != nil {
+		if err := need(pos, 1, "lab build <github-url> --device <mac> | --config <file>"); err != nil {
 			return err
 		}
-		b, err := c.Build(ctx, api.BuildRequest{Source: pos[0], Device: *dev, Force: *force})
+		req := api.BuildRequest{Source: pos[0], Device: *dev, Force: *force}
+		if *config != "" {
+			if *dev != "" {
+				return fmt.Errorf("give --device or --config, not both")
+			}
+			sha, err := artifact(ctx, c, *config)
+			if err != nil {
+				return err
+			}
+			req.Config, req.ConfigName = sha, filepath.Base(*config)
+		}
+		b, err := c.Build(ctx, req)
 		if err != nil {
 			return err
 		}

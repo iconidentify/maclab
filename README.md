@@ -173,6 +173,7 @@ login. A Mac leaves serial mode on every reboot, so labd asks oobd to re-arm aro
 ```sh
 lab run m1air --kernel https://github.com/iconidentify/aurora-linux/tree/custom/sep --gui-test gui-smoke
 lab build https://github.com/AsahiLinux/linux/pull/123 --device m1air
+lab build https://github.com/AsahiLinux/linux/pull/123 --config ./my.config   # one build for every Mac
 ```
 
 Agents do the same with `lab_run(source=...)`, `lab_build` and `lab_build_status`, and use `lab_exec`

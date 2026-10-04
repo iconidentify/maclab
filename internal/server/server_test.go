@@ -737,3 +737,75 @@ func TestCmdlineBaseAndStrip(t *testing.T) {
 		t.Fatalf("bad glob: %d %v", code, err)
 	}
 }
+
+func TestBuildWithUploadedConfig(t *testing.T) {
+	l := newLab(t, true)
+	l.baseline()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	builds := 0
+	go l.fakeBuilder(ctx, &builds)
+	cfg := l.artifact("CONFIG_ARM64=y\nCONFIG_APPLE_T6030_DISPLAY_GATE=y\n")
+	src := gitRepo(t)
+	b, err := l.s.EnsureBuild(ctx, api.BuildRequest{Source: src, Config: cfg, ConfigName: "unified.config"})
+	if err != nil || b.ConfigSHA != cfg || b.ConfigName != "unified.config" || b.Device != "" {
+		t.Fatalf("build %+v %v", b, err)
+	}
+	// A job built from the same source and config reuses that build, whatever Mac it runs on.
+	j := l.run(api.JobSpec{Source: src, Config: cfg})
+	l.expect(j, api.OutcomePass)
+	if j.Spec.Build != b.ID || builds != 1 {
+		t.Fatalf("job used build %s (want %s), %d builds", j.Spec.Build, b.ID, builds)
+	}
+	// The Mac's own config is a different build.
+	if b2, _ := l.s.EnsureBuild(ctx, api.BuildRequest{Source: src, Device: "sim-mac"}); b2.Key == b.Key {
+		t.Fatal("device config and uploaded config share a build key")
+	}
+	if _, code, err := l.s.Submit(api.JobSpec{Device: "sim-mac", Config: cfg}); err == nil || code != 400 {
+		t.Fatalf("config without a source: %d %v", code, err)
+	}
+}
+
+func TestRunningBuildSurvivesLabdRestart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dir := t.TempDir()
+	quiet := log.New(io.Discard, "", 0)
+	s1, err := New(ctx, Config{DataDir: dir, AdminToken: "a", BuilderToken: "bld"}, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	b := &api.Build{ID: "b1004-000000-abcd", Key: "k", Source: api.Source{Repo: "https://github.com/x/y", SHA: strings.Repeat("a", 40)},
+		ConfigSHA: "c", State: api.BuildRunning, Stage: "build", Created: now, Updated: now}
+	s1.saveBuild(b)
+	// labd restarts while the builder keeps compiling.
+	s2, err := New(ctx, Config{DataDir: dir, AdminToken: "a", BuilderToken: "bld"}, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond) // let buildMonitor's startup pass run
+	if got, _ := s2.getBuild(b.ID); got.State != api.BuildRunning {
+		t.Fatalf("after restart: %s %s", got.State, got.Error)
+	}
+	hs := httptest.NewServer(s2.Handler())
+	defer hs.Close()
+	up, _ := http.NewRequest("POST", hs.URL+"/api/builder/artifacts", strings.NewReader("kernel"))
+	up.Header.Set("Authorization", "Bearer bld")
+	resp, err := http.DefaultClient.Do(up)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var art struct{ SHA256 string }
+	json.NewDecoder(resp.Body).Decode(&art)
+	resp.Body.Close()
+	done, _ := json.Marshal(api.BuildResult{Release: "7.2-x", Artifact: art.SHA256, Seconds: 1})
+	req, _ := http.NewRequest("POST", hs.URL+"/api/builder/builds/"+b.ID+"/done", bytes.NewReader(done))
+	req.Header.Set("Authorization", "Bearer bld")
+	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != 204 {
+		t.Fatalf("done: %v %v", resp, err)
+	}
+	if got, _ := s2.getBuild(b.ID); got.State != api.BuildDone {
+		t.Fatalf("after done: %s %s", got.State, got.Error)
+	}
+}

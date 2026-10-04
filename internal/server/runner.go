@@ -476,7 +476,7 @@ func (r *jobRun) restore(ctx context.Context) error {
 func (r *jobRun) build(ctx context.Context) (string, string) {
 	r.state(api.JobBuilding)
 	r.ev("resolving %s", r.j.Spec.Source)
-	b, err := r.s.EnsureBuild(ctx, api.BuildRequest{Source: r.j.Spec.Source, Device: r.j.Spec.Device})
+	b, err := r.s.EnsureBuild(ctx, api.BuildRequest{Source: r.j.Spec.Source, Device: r.j.Spec.Device, Config: r.j.Spec.Config})
 	if err != nil {
 		return api.OutcomeBuildFailed, err.Error()
 	}
@@ -489,7 +489,11 @@ func (r *jobRun) build(ctx context.Context) (string, string) {
 	if b.State == api.BuildDone {
 		r.ev("reusing %s: already built from %s@%s %s (build %s)", b.Release, shortRepo(src.Repo), ref, src.SHA[:12], b.ID)
 	} else {
-		r.ev("building %s@%s %s with %s's config (build %s)", shortRepo(src.Repo), ref, src.SHA[:12], r.j.Spec.Device, b.ID)
+		whose := r.j.Spec.Device + "'s config"
+		if b.ConfigName != "" || r.j.Spec.Config != "" {
+			whose = "config " + orStr(b.ConfigName, short(r.j.Spec.Config))
+		}
+		r.ev("building %s@%s %s with %s (build %s)", shortRepo(src.Repo), ref, src.SHA[:12], whose, b.ID)
 		r.s.builds.mu.Lock()
 		builders := 0
 		for _, t := range r.s.builds.builders {

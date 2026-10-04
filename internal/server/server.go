@@ -821,6 +821,17 @@ func (s *Server) Submit(spec api.JobSpec) (*api.Job, int, error) {
 	if v == nil {
 		return nil, 404, fmt.Errorf("no device %q", spec.Device)
 	}
+	if spec.Config != "" {
+		if spec.Source == "" {
+			return nil, 400, errors.New("--config applies to a kernel built from a source URL")
+		}
+		if !reSHA.MatchString(spec.Config) {
+			return nil, 400, errors.New("config must be an artifact sha256 (upload it first)")
+		}
+		if _, err := os.Stat(s.artifactPath(spec.Config)); err != nil {
+			return nil, 400, fmt.Errorf("config artifact %s not uploaded", spec.Config)
+		}
+	}
 	if spec.Source != "" {
 		if spec.Kernel != "" {
 			return nil, 400, errors.New("give a kernel artifact or a source to build, not both")

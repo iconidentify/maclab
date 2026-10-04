@@ -156,8 +156,12 @@ func (s *Server) EnsureBuild(ctx context.Context, req api.BuildRequest) (*api.Bu
 		return nil, errors.New("say whose config to build with: a device, or a config artifact")
 	}
 	now := time.Now()
-	return s.queueBuild(&api.Build{ID: "b" + now.Format("0102-150405") + "-" + randHex(2), Key: buildKey(src, cfg), Source: src,
-		Device: req.Device, ConfigSHA: cfg, State: api.BuildQueued, Created: now, Updated: now}, req.Force)
+	b := &api.Build{ID: "b" + now.Format("0102-150405") + "-" + randHex(2), Key: buildKey(src, cfg), Source: src,
+		Device: req.Device, ConfigSHA: cfg, State: api.BuildQueued, Created: now, Updated: now}
+	if req.Config != "" {
+		b.Device, b.ConfigName = "", req.ConfigName // built with the uploaded config, not a Mac's
+	}
+	return s.queueBuild(b, req.Force)
 }
 
 // ensurePackageBuild queues a makepkg run of an uploaded recipe, optionally
@@ -604,11 +608,15 @@ func (s *Server) hBuilders(w http.ResponseWriter, r *http.Request) {
 // buildMonitor fails builds whose builder went silent, and on start fails
 // builds that were running when labd stopped.
 func (s *Server) buildMonitor() {
+	// A build that was running when labd stopped is usually still running on its
+	// builder, which keeps reporting to the new labd. Give it the same silence
+	// window as any build instead of failing it at once.
 	running, _ := s.store.builds(`state='running'`)
+	s.builds.mu.Lock()
 	for _, b := range running {
-		b.State, b.Error = api.BuildFailed, "labd restarted during the build"
-		s.saveBuild(b)
+		s.builds.beat[b.ID] = time.Now()
 	}
+	s.builds.mu.Unlock()
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
 	for {

@@ -270,6 +270,7 @@ type JobSpec struct {
 	Device         string     `json:"device"`
 	Kernel         string     `json:"kernel,omitempty"` // artifact sha256; empty = reboot on the current kernel
 	Source         string     `json:"source,omitempty"` // build this first: a GitHub/git URL of a repo, branch, commit or PR
+	Config         string     `json:"config,omitempty"` // source builds: artifact sha256 of a .config to build with, instead of the Mac's own
 	Build          string     `json:"build,omitempty"`  // the build job that produced Kernel
 	Cmdline        string     `json:"cmdline,omitempty"`
 	CmdlineBase    string     `json:"cmdline_base,omitempty"`  // see StageArgs.CmdlineBase
@@ -431,31 +432,32 @@ type BuildFile struct {
 }
 
 type Build struct {
-	ID        string      `json:"id"`
-	Kind      string      `json:"kind,omitempty"`   // "" (kernel) or "package"
-	Key       string      `json:"key"`              // sha256 of everything that decides the output: same key, same result
-	Source    Source      `json:"source"`           // package builds: the commit _commit was pointed at, if any
-	Device    string      `json:"device,omitempty"` // whose running config it uses
-	ConfigSHA string      `json:"config_sha"`
-	Recipe    string      `json:"recipe,omitempty"`     // package builds: artifact sha256 of the recipe tarball
-	RecipeDir string      `json:"recipe_dir,omitempty"` // where the recipe came from, for people
-	Pkgrel    string      `json:"pkgrel,omitempty"`     // pkgrel set on the recipe, if any
-	Files     []BuildFile `json:"files,omitempty"`      // package builds: the packages and the PKGBUILD as built
-	State     BuildState  `json:"state"`
-	Stage     string      `json:"stage,omitempty"`    // fetch, checkout, configure, build, package, upload
-	Progress  float64     `json:"progress,omitempty"` // 0..1 when known
-	ETA       float64     `json:"eta_sec,omitempty"`  // estimated seconds left, from earlier builds
-	Release   string      `json:"release,omitempty"`
-	Artifact  string      `json:"artifact,omitempty"` // what `lab run --kernel` boots; for packages, the kernel package
-	Size      int64       `json:"size,omitempty"`
-	Error     string      `json:"error,omitempty"`
-	Builder   string      `json:"builder,omitempty"`
-	Reused    bool        `json:"reused,omitempty"` // an earlier identical build was reused
-	Created   time.Time   `json:"created"`
-	Started   time.Time   `json:"started,omitempty"`
-	Updated   time.Time   `json:"updated"`
-	Seconds   float64     `json:"seconds,omitempty"`
-	LogLines  int         `json:"log_lines"`
+	ID         string      `json:"id"`
+	Kind       string      `json:"kind,omitempty"`   // "" (kernel) or "package"
+	Key        string      `json:"key"`              // sha256 of everything that decides the output: same key, same result
+	Source     Source      `json:"source"`           // package builds: the commit _commit was pointed at, if any
+	Device     string      `json:"device,omitempty"` // whose running config it uses
+	ConfigSHA  string      `json:"config_sha"`
+	ConfigName string      `json:"config_name,omitempty"` // file name of an uploaded config
+	Recipe     string      `json:"recipe,omitempty"`      // package builds: artifact sha256 of the recipe tarball
+	RecipeDir  string      `json:"recipe_dir,omitempty"`  // where the recipe came from, for people
+	Pkgrel     string      `json:"pkgrel,omitempty"`      // pkgrel set on the recipe, if any
+	Files      []BuildFile `json:"files,omitempty"`       // package builds: the packages and the PKGBUILD as built
+	State      BuildState  `json:"state"`
+	Stage      string      `json:"stage,omitempty"`    // fetch, checkout, configure, build, package, upload
+	Progress   float64     `json:"progress,omitempty"` // 0..1 when known
+	ETA        float64     `json:"eta_sec,omitempty"`  // estimated seconds left, from earlier builds
+	Release    string      `json:"release,omitempty"`
+	Artifact   string      `json:"artifact,omitempty"` // what `lab run --kernel` boots; for packages, the kernel package
+	Size       int64       `json:"size,omitempty"`
+	Error      string      `json:"error,omitempty"`
+	Builder    string      `json:"builder,omitempty"`
+	Reused     bool        `json:"reused,omitempty"` // an earlier identical build was reused
+	Created    time.Time   `json:"created"`
+	Started    time.Time   `json:"started,omitempty"`
+	Updated    time.Time   `json:"updated"`
+	Seconds    float64     `json:"seconds,omitempty"`
+	LogLines   int         `json:"log_lines"`
 }
 
 type BuildRequest struct {
@@ -463,6 +465,8 @@ type BuildRequest struct {
 	Device string `json:"device,omitempty"` // build with this Mac's running config
 	Config string `json:"config,omitempty"` // or: artifact sha256 of a .config
 	Force  bool   `json:"force,omitempty"`  // rebuild even if an identical build exists
+	// ConfigName is where an uploaded config came from (its file name), for people.
+	ConfigName string `json:"config_name,omitempty"`
 
 	// Package builds: Recipe is the artifact sha256 of a tarball of a PKGBUILD
 	// directory. Source, if given, repoints the recipe's _commit; Pkgrel sets pkgrel.
