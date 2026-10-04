@@ -247,7 +247,13 @@ func (s *Server) publishOMT(ctx context.Context, j *api.Job) (string, error) {
 	case !res.KnownGood:
 		return "", fmt.Errorf("ran on lab kernel %s, which the installed packages don't describe; only known-good runs are published", res.Kernel)
 	}
-	if kg := s.dev(j.Spec.Device).snapshot().KnownGood; kg != "" && res.Kernel != kg {
+	// A baseline makes the kernel it booted the known-good one, but only once it
+	// finishes, after this upload; until then compare with what it booted.
+	if j.Spec.Baseline {
+		if res.Kernel != j.Result.BootKernel {
+			return "", fmt.Errorf("report names kernel %s but the baseline booted %s", res.Kernel, j.Result.BootKernel)
+		}
+	} else if kg := s.dev(j.Spec.Device).snapshot().KnownGood; kg != "" && res.Kernel != kg {
 		return "", fmt.Errorf("report names kernel %s but the known-good kernel is %s", res.Kernel, kg)
 	}
 	body, err := os.ReadFile(filepath.Join(s.jobDir(j.ID), res.Report))

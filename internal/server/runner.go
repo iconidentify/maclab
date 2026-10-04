@@ -23,6 +23,9 @@ type jobRun struct {
 
 	bootID   string // the test kernel's boot, once it is up
 	bootedAt time.Time
+
+	armedBoot string    // the boot that was running when this job armed its one-shot and rebooted
+	armedAt   time.Time // when it did
 }
 
 func (r *jobRun) ev(format string, args ...any) {
@@ -119,6 +122,16 @@ func (s *Server) runJob(ctx context.Context, v *dev, j *api.Job) {
 		v.mu.Unlock()
 	}()
 
+	// A Mac still on a lab entry (an earlier job's restore failed or was cut
+	// short) goes back to its known-good kernel before this job stages anything.
+	if tag := v.snapshot().Health.JobTag; tag != "" {
+		r.ev("%s is still on lab entry %s; restoring its known-good kernel first", j.Spec.Device, tag)
+		if err := r.restore(ctx); err != nil {
+			r.finish(api.OutcomeInfra, "could not restore the known-good kernel before the job: "+err.Error())
+			return
+		}
+		dirty = false
+	}
 	if dirty {
 		if err := v.call(ctx, api.CmdCleanup, "", api.CleanupArgs{All: true}, 2*time.Minute, nil); err == nil {
 			v.mu.Lock()
@@ -194,6 +207,7 @@ func (r *jobRun) execute(ctx context.Context) (string, string) {
 	r.state(api.JobBooting)
 	oldBoot := v.snapshot().BootID
 	t0 := time.Now()
+	r.armedBoot, r.armedAt = oldBoot, t0
 	if err := v.call(ctx, api.CmdBootOnce, j.ID, api.BootOnceArgs{Entry: sr.Entry}, 2*time.Minute, nil); err != nil {
 		return api.OutcomeInfra, "arming the one-shot boot failed: " + err.Error()
 	}
@@ -437,6 +451,22 @@ func (r *jobRun) collect(ctx context.Context, boot string) []string {
 func (r *jobRun) restore(ctx context.Context) error {
 	v := r.v
 	r.state(api.JobRestoring)
+	// A job canceled while the Mac reboots into its test kernel must let that
+	// boot finish: deciding now would see the old boot, skip the reboot to the
+	// known-good kernel, and leave the Mac on the test kernel.
+	if r.armedBoot != "" {
+		v.mu.Lock()
+		pending := v.d.BootID == r.armedBoot || !v.aliveLocked()
+		v.mu.Unlock()
+		if pending {
+			r.ev("waiting for %s to finish rebooting before restoring", r.j.Spec.Device)
+			steps, _, err := v.waitBack(ctx, r.armedBoot, r.armedAt, r.boot)
+			r.addRecovery(steps)
+			if err != nil {
+				return err
+			}
+		}
+	}
 	d := v.snapshot()
 	if d.Health.JobTag != "" {
 		r.ev("rebooting back to the known-good kernel")

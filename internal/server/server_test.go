@@ -809,3 +809,57 @@ func TestRunningBuildSurvivesLabdRestart(t *testing.T) {
 		t.Fatalf("after done: %s %s", got.State, got.Error)
 	}
 }
+
+func TestCancelWhileBootingRestoresKnownGood(t *testing.T) {
+	l := newLab(t, true)
+	l.baseline()
+	l.sim.RebootDelay = 2 * time.Second // long enough to cancel mid-reboot
+	j, _, err := l.s.Submit(api.JobSpec{Device: "sim-mac", Kernel: l.artifact("krel=7.2-slow behavior=ok")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Cancel the moment the one-shot is armed, while the Mac reboots into the test kernel.
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		cur, _ := l.s.store.job(j.ID)
+		if cur.State == api.JobBooting {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if r, body := l.get("POST", "/api/jobs/"+j.ID+"/cancel"); r.StatusCode != 200 {
+		t.Fatalf("cancel: %s %s", r.Status, body)
+	}
+	j = l.wait(j.ID, 60*time.Second)
+	if j.Outcome != api.OutcomeCanceled {
+		t.Fatalf("outcome %s: %s", j.Outcome, j.Summary)
+	}
+	if d := l.s.dev("sim-mac").snapshot(); d.Kernel != agent.SimKnownGood || d.Health.JobTag != "" {
+		t.Fatalf("after the cancel the Mac runs %s (lab entry %q); events %v", d.Kernel, d.Health.JobTag, j.Events)
+	}
+	// The next job stages the same kernel without tripping over it.
+	l.sim.RebootDelay = 300 * time.Millisecond
+	l.expect(l.run(api.JobSpec{Kernel: l.artifact("krel=7.2-slow behavior=ok")}), api.OutcomePass)
+}
+
+func TestBaselinePublishesWhenKnownGoodChanges(t *testing.T) {
+	l := newLab(t, true)
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(201)
+		fmt.Fprint(w, `{"report_url":"https://site/r/1","deletion_url":"https://site/d/1"}`)
+	}))
+	defer site.Close()
+	l.s.cfg.OMT, l.s.cfg.OMTSite, l.s.cfg.OMTPublish = true, site.URL, true
+	l.waitDevice(func(d api.Device) bool { return d.Facts.AgentVersion != "" })
+	l.baseline()
+	// The Mac's kernel was upgraded outside the lab; the next baseline re-records it.
+	v := l.s.dev("sim-mac")
+	v.mu.Lock()
+	v.d.KnownGood = "7.1.12-old"
+	v.mu.Unlock()
+	j := l.run(api.JobSpec{Baseline: true})
+	l.expect(j, api.OutcomePass)
+	if o := j.Result.OMT; o == nil || o.Published != "https://site/r/1" {
+		t.Fatalf("baseline after a kernel change was not published: %+v", j.Result.OMT)
+	}
+}
