@@ -324,6 +324,9 @@ func guiEnv(name string, wait time.Duration) (*user.User, []string, error) {
 // DRM driver: boot splash, text console, emergency shell, login screen or
 // desktop. Without that it falls back to grim in a Wayland session.
 func (l *Linux) Screenshot(ctx context.Context, path string, wait time.Duration) (int, int, error) {
+	if l.GUIUser != "" {
+		awaitDRMMaster(ctx, min(wait, 30*time.Second))
+	}
 	kerr := kmsgrab(ctx, path)
 	if kerr == nil {
 		b, _ := os.ReadFile(path)
@@ -356,6 +359,60 @@ func displayCards() []string {
 		rest, _ = filepath.Glob("/dev/dri/card*")
 	}
 	return append(first, rest...)
+}
+
+// debugDRI is where the kernel lists each DRM minor's open files.
+var debugDRI = "/sys/kernel/debug/dri"
+
+// awaitDRMMaster keeps kmsgrab from taking the display card away from the
+// desktop as it starts. A process that opens a DRM card nobody is master of
+// becomes its master; if that happens while logind hands the card to the
+// compositor, TakeDevice fails with EBUSY and the desktop never comes up. So
+// for the first two minutes after boot it waits, at most limit, until
+// something else (compositor, greeter or boot splash) is the card's master.
+func awaitDRMMaster(ctx context.Context, limit time.Duration) {
+	cards := displayCards()
+	if len(cards) == 0 {
+		return
+	}
+	deadline := time.Now().Add(limit)
+	for uptime() < 2*time.Minute && time.Now().Before(deadline) {
+		if has, known := drmHasMaster(cards[0]); has || !known {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+// drmHasMaster reads a card's client list in debugfs. known is false when
+// debugfs can't tell.
+func drmHasMaster(card string) (has, known bool) {
+	minor := strings.TrimPrefix(filepath.Base(card), "card")
+	b, err := os.ReadFile(filepath.Join(debugDRI, minor, "clients"))
+	if err != nil {
+		return false, false
+	}
+	// "command tgid dev master a uid magic name id", one line per open file
+	lines := strings.Split(string(b), "\n")
+	for _, l := range lines[1:] {
+		if f := strings.Fields(l); len(f) >= 4 && f[3] == "y" {
+			return true, true
+		}
+	}
+	return false, true
+}
+
+func uptime() time.Duration {
+	f := strings.Fields(readTrim("/proc/uptime"))
+	if len(f) == 0 {
+		return 0
+	}
+	s, _ := strconv.ParseFloat(f[0], 64)
+	return time.Duration(s * float64(time.Second))
 }
 
 func kmsgrab(ctx context.Context, path string) error {
