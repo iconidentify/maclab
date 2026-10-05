@@ -609,6 +609,20 @@ func TestPackageBuild(t *testing.T) {
 	if r, _ := l.get("GET", "/api/builds/"+b.ID+"/files/..%2Fetc%2Fpasswd"); r.StatusCode != 404 {
 		t.Fatalf("unknown file: %s", r.Status)
 	}
+	// The recipe it was built from is served as uploaded, and the artifact GC
+	// keeps it even when it is old and the store is over budget.
+	if r, body := l.get("GET", "/api/builds/"+b.ID+"/files/"+api.RecipeFile); r.StatusCode != 200 || body != "PKGBUILD tarball" {
+		t.Fatalf("recipe: %s %q", r.Status, body)
+	}
+	month := time.Now().Add(-30 * 24 * time.Hour)
+	os.Chtimes(l.s.artifactPath(recipe), month, month)
+	budget := l.s.cfg.ArtifactBudget
+	l.s.cfg.ArtifactBudget = 1
+	l.s.gcArtifacts()
+	l.s.cfg.ArtifactBudget = budget
+	if _, err := os.Stat(l.s.artifactPath(recipe)); err != nil {
+		t.Fatalf("the artifact GC removed the recipe: %v", err)
+	}
 	// The same recipe and pkgrel again is the same build.
 	if again, err := l.s.EnsureBuild(ctx, api.BuildRequest{Recipe: recipe, Pkgrel: "11.14"}); err != nil || again.ID != b.ID {
 		t.Fatalf("not reused: %+v %v", again, err)

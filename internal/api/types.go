@@ -424,6 +424,10 @@ const (
 	BuildPackage = "package"
 )
 
+// RecipeFile is the name under which a package build serves the recipe
+// tarball it was built from, exactly as uploaded.
+const RecipeFile = "recipe.tar"
+
 // BuildFile is one output of a package build.
 type BuildFile struct {
 	Name   string `json:"name"`

@@ -938,6 +938,34 @@ func getBuildFiles(ctx context.Context, c *client.Client, b *api.Build, dir stri
 		}
 		fmt.Printf("%s  %s\n", sha, dst)
 	}
+	if b.Recipe != "" {
+		if err := getRecipe(ctx, c, b, dir); err != nil {
+			fmt.Fprintf(os.Stderr, "lab: the packages are complete, but not the recipe: %v\n", err)
+		}
+	}
+	return nil
+}
+
+// getRecipe unpacks the recipe a package build was made from, exactly as
+// uploaded (PKGBUILD, patches, data files), into dir/recipe/.
+func getRecipe(ctx context.Context, c *client.Client, b *api.Build, dir string) error {
+	tarball := filepath.Join(dir, api.RecipeFile)
+	sha, err := c.BuildFile(ctx, b.ID, api.RecipeFile, tarball)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tarball)
+	if sha != b.Recipe {
+		return fmt.Errorf("downloaded sha256 %s, but the build recorded %s", sha, b.Recipe)
+	}
+	rdir := filepath.Join(dir, "recipe")
+	if err := os.MkdirAll(rdir, 0o755); err != nil {
+		return err
+	}
+	if o, err := exec.Command("tar", "-C", rdir, "--no-same-owner", "-xf", tarball).CombinedOutput(); err != nil {
+		return fmt.Errorf("unpacking: %v: %s", err, o)
+	}
+	fmt.Printf("%s  %s/ (the recipe as uploaded)\n", sha, rdir)
 	return nil
 }
 

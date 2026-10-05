@@ -512,6 +512,16 @@ func (s *Server) hBuildFile(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if name == api.RecipeFile && b.Recipe != "" {
+		if _, err := os.Stat(s.artifactPath(b.Recipe)); err != nil {
+			httpErr(w, 404, "build %s: its recipe %s is no longer stored", b.ID, b.Recipe[:12])
+			return
+		}
+		w.Header().Set("Content-Disposition", `attachment; filename="`+api.RecipeFile+`"`)
+		w.Header().Set("Content-Type", "application/x-tar")
+		http.ServeFile(w, r, s.artifactPath(b.Recipe))
+		return
+	}
 	httpErr(w, 404, "build %s has no file %q", b.ID, name)
 }
 

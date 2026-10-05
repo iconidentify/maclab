@@ -30,7 +30,8 @@ func (s *Server) gcLoop() {
 // gcArtifacts keeps the artifact store bounded. Anything a recent job, a
 // recent build or a device config refers to is kept; everything else is
 // deleted once it is a day old. If the store is still over budget, the
-// oldest artifacts go first, except those in use by unfinished work.
+// oldest artifacts go first, except those in use by unfinished work, device
+// configs and package recipes.
 func (s *Server) gcArtifacts() {
 	gcMu.Lock()
 	defer gcMu.Unlock()
@@ -76,6 +77,18 @@ func (s *Server) gcArtifacts() {
 				keep[f.SHA256] = true
 			}
 		}
+	}
+	// A package recipe is small and is the only record of what a release was
+	// built from, so it stays for as long as any build refers to it.
+	if rows, err := s.store.db.Query(`SELECT DISTINCT json_extract(data, '$.recipe') FROM builds
+		WHERE json_extract(data, '$.recipe') != ''`); err == nil {
+		for rows.Next() {
+			var sha string
+			rows.Scan(&sha)
+			keep[sha] = true
+			pinned[sha] = true
+		}
+		rows.Close()
 	}
 	rows, _ := s.store.db.Query(`SELECT sha FROM configs`)
 	if rows != nil {

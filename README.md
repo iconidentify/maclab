@@ -231,7 +231,8 @@ lab package ~/recipes/linux-aurora                        # the recipe exactly a
 lab package ~/recipes/linux-aurora --pkgrel 11.14 \
     --commit https://github.com/iconidentify/aurora-linux/commit/<sha> -o ./rel
 lab run m1air --kernel <build-id>                         # boot the kernel package once
-lab build-get <build-id> -o ./rel                         # packages + the PKGBUILD as built, sha256-checked
+lab build-get <build-id> -o ./rel                         # packages + the PKGBUILD as built, sha256-checked,
+                                                          # and the uploaded recipe (patches, data files) in ./rel/recipe/
 ```
 
 A kernel build (above) makes a lab test artifact. A package build makes the release: it runs a
