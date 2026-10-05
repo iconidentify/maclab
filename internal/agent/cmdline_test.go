@@ -51,7 +51,7 @@ func TestStageCmdlineRefusesNoRoot(t *testing.T) {
 		t.Fatal("a literal base without root= should be refused")
 	}
 	got, err := stageCmdline(m3KnownGood, stock, api.StageArgs{CmdlineBase: "root=/dev/sda2 ro"}, "j5")
-	if err != nil || !strings.HasPrefix(got, "root=/dev/sda2 ro loglevel=7") {
+	if err != nil || !strings.HasPrefix(got, "root=/dev/sda2 ro panic=10") {
 		t.Fatalf("literal base: %q %v", got, err)
 	}
 }

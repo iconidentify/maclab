@@ -175,6 +175,10 @@ type StageArgs struct {
 	// CmdlineStrip removes base parameters whose name (before "=") or whole
 	// text matches one of these globs, e.g. "asahi.*".
 	CmdlineStrip []string `json:"cmdline_strip,omitempty"`
+	// Verbose boots with loglevel=7 and without quiet/splash, for watching the
+	// console. Otherwise a test boot keeps the base's own; a Mac with a serial
+	// console is always verbose.
+	Verbose bool `json:"verbose,omitempty"`
 }
 
 type StageResult struct {
@@ -275,6 +279,7 @@ type JobSpec struct {
 	Cmdline        string     `json:"cmdline,omitempty"`
 	CmdlineBase    string     `json:"cmdline_base,omitempty"`  // see StageArgs.CmdlineBase
 	CmdlineStrip   []string   `json:"cmdline_strip,omitempty"` // see StageArgs.CmdlineStrip
+	VerboseBoot    bool       `json:"verbose_boot,omitempty"`  // see StageArgs.Verbose
 	Tests          []TestSpec `json:"tests,omitempty"`
 	BootTimeoutSec int        `json:"boot_timeout_sec,omitempty"`
 	Crash          string     `json:"crash,omitempty"` // crash test mode, see CrashArgs

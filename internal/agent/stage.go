@@ -189,20 +189,29 @@ func stockCmdline() (string, error) {
 	return string(m[2]), nil
 }
 
-// testCmdline starts from the base cmdline, makes boot verbose, makes
-// panics reboot, and tags the boot so labd can tell which entry came up.
+// testCmdline starts from the base cmdline, makes panics reboot, and tags the
+// boot so labd can tell which entry came up. It keeps the base's quiet, splash
+// and loglevel, so a test boot starts the way the user's own boots do (an M1
+// Pro's desktop failed to start only with them removed); dmesg and the journal
+// record every level anyway. A serial console, or a.Verbose, makes the
+// boot verbose instead: no quiet or splash, and loglevel=7.
 func testCmdline(base string, a api.StageArgs, job string) string {
+	verbose := a.Serial || a.Verbose
 	var out []string
 	for _, f := range strings.Fields(base) {
 		switch {
 		case strings.HasPrefix(f, "BOOT_IMAGE="), strings.HasPrefix(f, "initrd="),
-			strings.HasPrefix(f, "maclab."), strings.HasPrefix(f, "panic="),
-			strings.HasPrefix(f, "loglevel="), f == "quiet", f == "splash":
+			strings.HasPrefix(f, "maclab."), strings.HasPrefix(f, "panic="):
+			continue
+		case verbose && (strings.HasPrefix(f, "loglevel=") || f == "quiet" || f == "splash"):
 			continue
 		}
 		out = append(out, f)
 	}
-	out = append(out, "loglevel=7", "panic=10")
+	if verbose {
+		out = append(out, "loglevel=7")
+	}
+	out = append(out, "panic=10")
 	if a.Serial {
 		out = append(out, "console=ttySAC0,115200", "console=tty0")
 	}

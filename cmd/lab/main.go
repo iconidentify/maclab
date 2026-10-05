@@ -32,7 +32,7 @@ const usage = `lab: run kernels and tests on Omarchy Macs
                                       build release packages from a PKGBUILD recipe with makepkg, as the release machine does
   lab builds | lab build-log <build> [-f] | lab build-get <build> [-o dir]
   lab exec <device> <command...>      run a command on a Mac as root (agent, or serial if its network is down)
-  lab run <device> [--kernel <file|sha256|build-id|github-url>] [--cmdline ".."] [--cmdline-base known-good|default|"<cmdline>"] [--cmdline-strip "glob .."] [--test boot-health] [--gui-test gui-smoke]
+  lab run <device> [--kernel <file|sha256|build-id|github-url>] [--cmdline ".."] [--cmdline-base known-good|default|"<cmdline>"] [--cmdline-strip "glob .."] [--verbose-boot] [--test boot-health] [--gui-test gui-smoke]
                    [--script t.sh] [--gui-script t.sh] [--boot-timeout 240] [--script-timeout 90m] [--publish] [--omt-allow ids] [--no-wait]
   lab crashtest <device>              deliberately panic the Mac and check it recovers by itself
   lab pack --build <O= dir> [-o kernel.tar.zst]    package a kernel build for lab run
@@ -190,6 +190,7 @@ func dispatch(ctx context.Context, c *client.Client, cmd string, args []string) 
 		runConfig := fs.String("config", "", "with a source URL --kernel: build with this .config (file or uploaded sha256) instead of the Mac's own")
 		cmdlineBase := fs.String("cmdline-base", "", `cmdline the test boot starts from: known-good (default), "default" (the distro's stock KERNEL_CMDLINE[default]), or a literal cmdline with root=`)
 		cmdlineStrip := fs.String("cmdline-strip", "", `globs of base parameters to drop, space- or comma-separated, e.g. 'asahi.* apple_t6030_display.* dcpext_*'`)
+		verboseBoot := fs.Bool("verbose-boot", false, "boot with loglevel=7 and without quiet/splash, to watch the console (default: keep the Mac's own; always verbose with a serial console)")
 		bootTimeout := fs.Int("boot-timeout", 0, "seconds to wait for the Mac to come back (default 240)")
 		noWait := fs.Bool("no-wait", false, "queue and return")
 		scriptTimeout := fs.Duration("script-timeout", 0, "time each --script/--gui-script test may run, e.g. 90m for a hands-on session (default 5m, at most 4h)")
@@ -208,6 +209,7 @@ func dispatch(ctx context.Context, c *client.Client, cmd string, args []string) 
 		spec.OMTAllow = splitAllow(*omtAllow)
 		spec.CmdlineBase = *cmdlineBase
 		spec.CmdlineStrip = strings.FieldsFunc(*cmdlineStrip, func(r rune) bool { return r == ',' || r == ' ' })
+		spec.VerboseBoot = *verboseBoot
 		if *scriptTimeout > 4*time.Hour {
 			return fmt.Errorf("--script-timeout %s: at most 4h", *scriptTimeout)
 		}

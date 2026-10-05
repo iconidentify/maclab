@@ -65,6 +65,7 @@ func serveMCP(ctx context.Context) error {
 		Cmdline          string   `json:"cmdline,omitempty" jsonschema:"extra kernel command line arguments, appended to the base"`
 		CmdlineBase      string   `json:"cmdline_base,omitempty" jsonschema:"cmdline the test boot starts from: known-good (default), default (the distro's stock KERNEL_CMDLINE[default]), or a literal cmdline with root="`
 		CmdlineStrip     []string `json:"cmdline_strip,omitempty" jsonschema:"globs of base parameters to drop, e.g. asahi.* apple_t6030_display.*"`
+		VerboseBoot      bool     `json:"verbose_boot,omitempty" jsonschema:"boot with loglevel=7 and without quiet/splash; by default a test boot keeps the Mac's own (always verbose with a serial console)"`
 		Tests            []string `json:"tests,omitempty" jsonschema:"builtin tests: boot-health (always run), gui-smoke, gui-terminal"`
 		GUITests         []string `json:"gui_tests,omitempty" jsonschema:"builtin tests to run inside the GUI user's Hyprland session: gui-smoke, gui-terminal"`
 		Scripts          []string `json:"scripts,omitempty" jsonschema:"local paths of shell scripts to run as tests (as root); write outputs to $MACLAB_OUT"`
@@ -78,7 +79,7 @@ func serveMCP(ctx context.Context) error {
 	mcp.AddTool(s, &mcp.Tool{Name: "lab_run", Description: "Boot a kernel on a Mac once and run tests. Give source (a GitHub URL) to build it first, or a kernel artifact. Returns the job; use lab_wait for the result."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, a runArg) (*mcp.CallToolResult, any, error) {
 			spec := api.JobSpec{Device: a.Device, Kernel: a.KernelSHA256, Source: a.Source, Cmdline: a.Cmdline, BootTimeoutSec: a.BootTimeoutSec, Holder: who, Publish: a.Publish, OMTAllow: a.OMTAllow,
-				CmdlineBase: a.CmdlineBase, CmdlineStrip: a.CmdlineStrip}
+				CmdlineBase: a.CmdlineBase, CmdlineStrip: a.CmdlineStrip, VerboseBoot: a.VerboseBoot}
 			if a.KernelPath != "" {
 				sha, err := c.Upload(ctx, a.KernelPath)
 				if err != nil {

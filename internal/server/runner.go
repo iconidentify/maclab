@@ -191,7 +191,7 @@ func (r *jobRun) execute(ctx context.Context) (string, string) {
 	r.ev("staging %s", what)
 	d := v.snapshot()
 	args := api.StageArgs{Artifact: j.Spec.Kernel, Cmdline: j.Spec.Cmdline, Serial: d.OOB != nil,
-		CmdlineBase: j.Spec.CmdlineBase, CmdlineStrip: j.Spec.CmdlineStrip}
+		CmdlineBase: j.Spec.CmdlineBase, CmdlineStrip: j.Spec.CmdlineStrip, Verbose: j.Spec.VerboseBoot}
 	if err := v.call(ctx, api.CmdStage, j.ID, args, 20*time.Minute, &sr); err != nil {
 		return api.OutcomeStageFailed, "staging failed: " + err.Error()
 	}

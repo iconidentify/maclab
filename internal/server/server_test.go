@@ -753,6 +753,23 @@ func TestCmdlineBaseAndStrip(t *testing.T) {
 	}
 }
 
+// Without a serial console a test boot keeps the base's quiet and splash,
+// unless the job asks for a verbose boot.
+func TestQuietTestBoots(t *testing.T) {
+	l := newLab(t, false)
+	l.baseline()
+	j := l.run(api.JobSpec{Kernel: l.artifact("krel=7.2-quiet behavior=ok"), CmdlineBase: "default"})
+	l.expect(j, api.OutcomePass)
+	if c := j.Result.BootCmdline; !strings.HasPrefix(c, "root=UUID=sim rw quiet splash panic=10") || strings.Contains(c, "loglevel=7") {
+		t.Fatalf("quiet boot: %q", c)
+	}
+	j = l.run(api.JobSpec{Kernel: l.artifact("krel=7.2-verbose behavior=ok"), CmdlineBase: "default", VerboseBoot: true})
+	l.expect(j, api.OutcomePass)
+	if c := j.Result.BootCmdline; !strings.HasPrefix(c, "root=UUID=sim rw loglevel=7 panic=10") || strings.Contains(c, "quiet") {
+		t.Fatalf("verbose boot: %q", c)
+	}
+}
+
 func TestBuildWithUploadedConfig(t *testing.T) {
 	l := newLab(t, true)
 	l.baseline()
