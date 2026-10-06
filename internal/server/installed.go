@@ -563,6 +563,9 @@ func writeOnce(path string, b []byte) error {
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
+	if err == nil {
+		err = syncDir(filepath.Dir(path)) // the new name is durable too
+	}
 	if err != nil {
 		os.Remove(path)
 	}
@@ -848,8 +851,8 @@ func (s *Server) hPromote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ledger := filepath.Join(s.frozenDir(release), "promotions.log")
-	if b, err := os.ReadFile(ledger); err == nil && strings.Contains(string(b), "\t"+j.ID+"\t") {
-		httpErr(w, 409, "job %s is already in %s", j.ID, ledger)
+	if b, err := os.ReadFile(ledger); err == nil && promotedIn(b, j.ID) {
+		httpErr(w, 409, "job %s is already promoted in %s", j.ID, ledger)
 		return
 	} else if err != nil && !os.IsNotExist(err) {
 		httpErr(w, 500, "reading %s: %v", ledger, err)
@@ -942,10 +945,16 @@ func (s *Server) promote(v *dev, release string, j *api.Job, by, ledger string, 
 		staged[p] = t
 	}
 	line := fmt.Sprintf("%s\t%s\t%s\t%s\taccepted-by=%s\n", time.Now().Format(time.RFC3339), j.Spec.Device, j.ID, j.Result.BootKernel, by)
+	fail := func(why string) string {
+		return fmt.Sprintf("%s\t%s\t%s\tFAILED\t%s\n", time.Now().Format(time.RFC3339), j.Spec.Device, j.ID, why)
+	}
 	if err := appendSynced(ledger, line); err != nil {
 		cleanup()
+		// the line may be in the file without being durable: say it didn't happen
+		appendSynced(ledger, fail("not recorded: "+err.Error()))
 		return "", fmt.Errorf("recording the promotion in %s: %v; nothing was changed", ledger, err)
 	}
+	var kept []string // .before-<job> copies this attempt made
 	failed := func(applied []string, why error) error {
 		var undo []string
 		for _, p := range applied {
@@ -954,14 +963,24 @@ func (s *Server) promote(v *dev, release string, j *api.Job, by, ledger string, 
 					undo = append(undo, p+": "+werr.Error())
 				}
 			} else if os.IsNotExist(err) {
-				os.Remove(p)
+				if rerr := os.Remove(p); rerr == nil {
+					if serr := syncDir(filepath.Dir(p)); serr != nil {
+						undo = append(undo, p+": "+serr.Error())
+					}
+				} else {
+					undo = append(undo, p+": "+rerr.Error())
+				}
 			} else {
 				undo = append(undo, p+": "+err.Error())
 			}
 		}
 		cleanup()
-		note := fmt.Sprintf("%s\t%s\t%s\tFAILED\t%v\n", time.Now().Format(time.RFC3339), j.Spec.Device, j.ID, why)
-		lerr := appendSynced(ledger, note)
+		if len(undo) == 0 { // the live references are the old ones again: their copies can go
+			for _, k := range kept {
+				os.Remove(k)
+			}
+		}
+		lerr := appendSynced(ledger, fail(why.Error()))
 		msg := fmt.Sprintf("promotion of %s failed: %v; the previous references were put back", j.ID, why)
 		if len(undo) > 0 {
 			msg = fmt.Sprintf("promotion of %s failed: %v; and putting back the previous references failed: %s (copies are in <file>.before-%s)", j.ID, why, strings.Join(undo, "; "), j.ID)
@@ -977,6 +996,7 @@ func (s *Server) promote(v *dev, release string, j *api.Job, by, ledger string, 
 			if err := writeOnce(p+".before-"+j.ID, old); err != nil {
 				return "", failed(applied, fmt.Errorf("keeping the previous %s: %v", p, err))
 			}
+			kept = append(kept, p+".before-"+j.ID)
 		} else if !os.IsNotExist(err) {
 			return "", failed(applied, err)
 		}
@@ -985,6 +1005,9 @@ func (s *Server) promote(v *dev, release string, j *api.Job, by, ledger string, 
 		}
 		delete(staged, p)
 		applied = append(applied, p)
+		if err := syncDir(filepath.Dir(p)); err != nil {
+			return "", failed(applied, fmt.Errorf("syncing %s after replacing %s: %v", filepath.Dir(p), p, err))
+		}
 	}
 	v.mu.Lock()
 	prev := v.d.KnownGood
@@ -1000,7 +1023,7 @@ func (s *Server) promote(v *dev, release string, j *api.Job, by, ledger string, 
 	return line, nil
 }
 
-// appendSynced appends a line to a file and syncs it.
+// appendSynced appends a line to a file and syncs it and its directory.
 func appendSynced(path, line string) error {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -1012,7 +1035,22 @@ func appendSynced(path, line string) error {
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
+	if err == nil {
+		err = syncDir(filepath.Dir(path))
+	}
 	return err
+}
+
+// promotedIn says whether a job's last ledger record is a promotion (a FAILED
+// record after it means the attempt was undone).
+func promotedIn(ledger []byte, job string) bool {
+	promoted := false
+	for _, l := range strings.Split(string(ledger), "\n") {
+		if f := strings.Split(l, "\t"); len(f) >= 4 && f[2] == job {
+			promoted = f[3] != "FAILED"
+		}
+	}
+	return promoted
 }
 
 // sameFiles says whether two directories hold the same regular files, byte for byte.

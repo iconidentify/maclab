@@ -499,15 +499,16 @@ func TestPublishDirSyncFailures(t *testing.T) {
 	// the sync after the rename fails: nothing stays published
 	saved := syncDir
 	defer func() { syncDir = saved }()
-	calls := 0
+	root2 := t.TempDir()
+	parentSyncs := 0
 	syncDir = func(p string) error {
-		calls++
-		if calls == 3 {
-			return errors.New("injected sync failure")
+		if p == root2 {
+			if parentSyncs++; parentSyncs == 2 { // the first is before writing, the second after the rename
+				return errors.New("injected sync failure")
+			}
 		}
 		return saved(p)
 	}
-	root2 := t.TempDir()
 	dst := filepath.Join(root2, "published")
 	if err := publishDir(src, dst, "job.json"); err == nil || !strings.Contains(err.Error(), "moved aside") {
 		t.Fatalf("failed sync after rename: %v", err)
@@ -517,5 +518,71 @@ func TestPublishDirSyncFailures(t *testing.T) {
 	}
 	if left, _ := os.ReadDir(root2); len(left) != 0 {
 		t.Fatalf("left behind: %v", left)
+	}
+}
+
+// Promotion makes every new name durable: each file it creates, the ledger, and
+// each reference it renames into place has its directory synced, and a sync
+// that fails at any of those points fails the promotion with the previous
+// references and known-good kernel in place, so it can be tried again.
+func TestPromotionDurability(t *testing.T) {
+	l, msha, _ := installedLab(t, nil)
+	j := l.run(api.JobSpec{InstalledManifest: msha, Holder: "tester"})
+	l.expect(j, api.OutcomePass)
+	kg := l.s.dev("sim-mac").snapshot().KnownGood
+	refs := []string{l.s.omtBaselinePath("sim-mac"), l.s.baselinePath("sim-mac")}
+	before := map[string][]byte{}
+	for _, p := range refs {
+		before[p], _ = os.ReadFile(p)
+	}
+	saved := syncDir
+	defer func() { syncDir = saved }()
+	promote := func(failAt int) (int, int) {
+		calls := 0
+		syncDir = func(p string) error {
+			calls++
+			if calls == failAt {
+				return errors.New("injected directory sync failure")
+			}
+			return saved(p)
+		}
+		resp, _ := l.post("/api/installed/9.9/promote", map[string]any{"device": "sim-mac", "job": j.ID, "accepted_by": "dave"})
+		syncDir = saved
+		return resp.StatusCode, calls
+	}
+	for k := 1; ; k++ {
+		code, calls := promote(k)
+		if code == 200 {
+			// staged x2, ledger, kept copies x2, renames x2: seven directory syncs at least
+			if k <= 7 || calls < 7 {
+				t.Fatalf("promotion succeeded with only %d directory syncs (injection at %d)", calls, k)
+			}
+			break
+		}
+		if code != 500 {
+			t.Fatalf("sync failure %d: HTTP %d", k, code)
+		}
+		if got := l.s.dev("sim-mac").snapshot().KnownGood; got != kg {
+			t.Fatalf("sync failure %d moved known-good to %s", k, got)
+		}
+		for _, p := range refs {
+			if b, _ := os.ReadFile(p); !bytes.Equal(b, before[p]) {
+				t.Fatalf("sync failure %d left %s changed", k, p)
+			}
+			if _, err := os.Stat(p + ".before-" + j.ID); err == nil {
+				t.Fatalf("sync failure %d left %s.before-%s", k, p, j.ID)
+			}
+		}
+		if left, _ := filepath.Glob(filepath.Join(filepath.Dir(refs[0]), "*.promote-*")); len(left) > 0 {
+			t.Fatalf("sync failure %d left %v", k, left)
+		}
+	}
+	if l.s.dev("sim-mac").snapshot().KnownGood != tKrel {
+		t.Fatal("the final promotion did not take")
+	}
+	b, err := os.ReadFile(filepath.Join(l.s.frozenDir("9.9"), "promotions.log"))
+	// the two staging failures come before the ledger line; the other five each leave a FAILED record
+	if err != nil || !promotedIn(b, j.ID) || strings.Count(string(b), "\tFAILED\t") != 5 {
+		t.Fatalf("ledger (%v):\n%s", err, b)
 	}
 }
