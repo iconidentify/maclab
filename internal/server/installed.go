@@ -401,12 +401,12 @@ func (ir *installedRun) omt(tr *api.TestResult, res *api.OMTResult, report []byt
 	}
 }
 
-// kernelLogs returns the test boot's kernel error lines, or why the job can't
+// kernelLogs returns the test boot's full kernel log and its warning lines, or why the job can't
 // be judged without them: a collection that failed, a file that didn't arrive
 // or can't be read, an empty kernel log, or journalctl reporting an error.
-func kernelLogs(jobDir string, files []string, collectErr error) ([]byte, error) {
+func kernelLogs(jobDir string, files []string, collectErr error) (kernel, warnings []byte, err error) {
 	if collectErr != nil {
-		return nil, fmt.Errorf("collecting logs failed: %v", collectErr)
+		return nil, nil, fmt.Errorf("collecting logs failed: %v", collectErr)
 	}
 	read := func(name string) ([]byte, error) {
 		if !slices.Contains(files, "boot0/"+name) {
@@ -423,7 +423,7 @@ func kernelLogs(jobDir string, files []string, collectErr error) ([]byte, error)
 	}
 	st, err := read("collect-status.txt")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// exactly one status line per required log, and it says ok
 	for _, name := range []string{"kernel.txt", "dmesg-errors.txt"} {
@@ -435,21 +435,25 @@ func kernelLogs(jobDir string, files []string, collectErr error) ([]byte, error)
 		}
 		switch {
 		case len(lines) == 0:
-			return nil, fmt.Errorf("boot0/%s is not valid evidence: collect-status.txt doesn't report it", name)
+			return nil, nil, fmt.Errorf("boot0/%s is not valid evidence: collect-status.txt doesn't report it", name)
 		case len(lines) > 1:
-			return nil, fmt.Errorf("boot0/%s is not valid evidence: collect-status.txt reports it %d times", name, len(lines))
+			return nil, nil, fmt.Errorf("boot0/%s is not valid evidence: collect-status.txt reports it %d times", name, len(lines))
 		case lines[0] != "ok":
-			return nil, fmt.Errorf("boot0/%s is not valid evidence: %s", name, lines[0])
+			return nil, nil, fmt.Errorf("boot0/%s is not valid evidence: %s", name, lines[0])
 		}
 	}
 	kern, err := read("kernel.txt")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(bytes.TrimSpace(kern)) == 0 {
-		return nil, errors.New("boot0/kernel.txt is empty: the journal has no kernel log for the test boot")
+		return nil, nil, errors.New("boot0/kernel.txt is empty: the journal has no kernel log for the test boot")
 	}
-	return read("dmesg-errors.txt")
+	warn, err := read("dmesg-errors.txt")
+	if err != nil {
+		return nil, nil, err
+	}
+	return kern, warn, nil
 }
 
 // dmesg compares the run's kernel error lines with the frozen ones.
@@ -575,14 +579,24 @@ func publishDir(src, dst, last string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
+	// the rename is only durable once the parent is synced: fail before
+	// writing anything if it can't be
+	if err := syncDir(filepath.Dir(dst)); err != nil {
+		return fmt.Errorf("syncing %s: %w", filepath.Dir(dst), err)
+	}
 	tmp, err := os.MkdirTemp(filepath.Dir(dst), "."+filepath.Base(dst)+".partial-")
 	if err != nil {
 		return err
 	}
 	ok := false
 	defer func() {
-		if !ok {
-			os.RemoveAll(tmp)
+		if !ok { // the staging directory holds only files: unlink them, then it
+			if ents, err := os.ReadDir(tmp); err == nil {
+				for _, e := range ents {
+					os.Remove(filepath.Join(tmp, e.Name()))
+				}
+			}
+			os.Remove(tmp)
 		}
 	}()
 	ents, err := os.ReadDir(src)
@@ -619,15 +633,35 @@ func publishDir(src, dst, last string) error {
 	if err := os.Chmod(tmp, 0o755); err != nil {
 		return err
 	}
+	if err := syncDir(tmp); err != nil {
+		return fmt.Errorf("syncing %s: %w", tmp, err)
+	}
 	if err := unix.Renameat2(unix.AT_FDCWD, tmp, unix.AT_FDCWD, dst, unix.RENAME_NOREPLACE); err != nil {
 		return fmt.Errorf("publishing %s: %w", dst, err)
 	}
-	ok = true
-	if d, err := os.Open(filepath.Dir(dst)); err == nil {
-		d.Sync()
-		d.Close()
+	if err := syncDir(filepath.Dir(dst)); err != nil {
+		// not durably published: take it back out of the frozen store's view
+		if qerr := unix.Renameat2(unix.AT_FDCWD, dst, unix.AT_FDCWD, tmp, unix.RENAME_NOREPLACE); qerr != nil {
+			return fmt.Errorf("syncing %s after publishing %s: %v; and moving it aside failed: %v", filepath.Dir(dst), dst, err, qerr)
+		}
+		return fmt.Errorf("syncing %s after publishing %s: %w; moved aside", filepath.Dir(dst), dst, err)
 	}
+	ok = true
 	return nil
+}
+
+// syncDir fsyncs a directory, so the entries in it are durable. A test can
+// replace it to make it fail.
+var syncDir = func(path string) error {
+	d, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	err = d.Sync()
+	if cerr := d.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 type freezeManifestReq struct {
@@ -803,6 +837,11 @@ func (s *Server) hPromote(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, 409, "job %s's frozen kernel errors: %v", j.ID, err)
 		return
 	}
+	// what becomes the reference must be what the frozen comparisons judged
+	if err := s.promotionInputs(j, report, status, tool, kernel, dm); err != nil {
+		httpErr(w, 409, "job %s: %v", j.ID, err)
+		return
+	}
 	ob, err := json.MarshalIndent(omtBaseline{Job: j.ID, Time: time.Now(), Kernel: kernel, Tool: tool, Status: status}, "", "  ")
 	if err != nil {
 		httpErr(w, 500, "%v", err)
@@ -827,6 +866,53 @@ func (s *Server) hPromote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"promoted": req.Device, "job": j.ID, "known_good": j.Result.BootKernel, "log": strings.TrimSpace(line)})
+}
+
+// promotionInputs checks that the report and kernel errors a promotion would
+// make the references are the bytes the job's frozen comparisons were made
+// from, and that comparing that report with the frozen pre-install one again
+// still gives the frozen transitions and NO_REGRESSION.
+func (s *Server) promotionInputs(j *api.Job, report []byte, status map[string]string, tool, kernel string, dm []byte) error {
+	ir := j.Result.Installed
+	var oc installed.OMTCompare
+	b, err := os.ReadFile(filepath.Join(ir.Frozen, "omt-compare.json"))
+	if err == nil {
+		err = json.Unmarshal(b, &oc)
+	}
+	if err != nil {
+		return fmt.Errorf("frozen omt-compare.json: %v", err)
+	}
+	if got := installed.SHA256(report); got != oc.Current.ReportSHA256 {
+		return fmt.Errorf("its omarchy-m-test report is now %s, not the %s its frozen comparison judged", got, oc.Current.ReportSHA256)
+	}
+	c, err := s.loadInstalled(j.Spec.InstalledManifest, j.Spec.Device)
+	if err != nil {
+		return err
+	}
+	if oc.Frozen.ReportSHA256 != c.omtSHA {
+		return fmt.Errorf("its frozen comparison was made against report %s, not the frozen pre-install %s", oc.Frozen.ReportSHA256, c.omtSHA)
+	}
+	re := installed.CompareOMT(j.ID, j.Spec.Device,
+		installed.OMTSide{Job: c.frozenJob, Report: c.omtReport, ReportSHA256: c.omtSHA, Tool: c.omtTool, Kernel: c.omtKernel}, c.omtStatus,
+		installed.OMTSide{Job: j.ID, Report: oc.Current.Report, ReportSHA256: oc.Current.ReportSHA256, Tool: tool, Kernel: kernel}, status)
+	if re.Verdict != "NO_REGRESSION" {
+		return fmt.Errorf("its omarchy-m-test report regresses against the frozen pre-install report: %v", re.Regressions)
+	}
+	if a, _ := json.Marshal(re.Transitions); string(a) != func() string { b, _ := json.Marshal(oc.Transitions); return string(b) }() {
+		return errors.New("recomparing its omarchy-m-test report does not give the frozen transitions")
+	}
+	var dc installed.DmesgCompare
+	b, err = os.ReadFile(filepath.Join(ir.Frozen, "dmesg-compare.json"))
+	if err == nil {
+		err = json.Unmarshal(b, &dc)
+	}
+	if err != nil {
+		return fmt.Errorf("frozen dmesg-compare.json: %v", err)
+	}
+	if got := installed.SHA256(dm); got != dc.Current.SHA256 || dc.Disposition != ir.Dmesg || len(dc.FatalHits) > 0 {
+		return fmt.Errorf("its kernel errors (%s, %s) are not what the frozen comparison judged (%s, %s)", got, ir.Dmesg, dc.Current.SHA256, dc.Disposition)
+	}
+	return nil
 }
 
 // promote replaces a Mac's references and known-good kernel with an accepted

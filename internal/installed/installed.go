@@ -688,14 +688,22 @@ type DmesgCompare struct {
 // CompareDmesg diffs the current kernel error lines against the frozen ones
 // (detect.NewLines both ways). Fatal lines block wherever they appear, even
 // if the frozen baseline had them too.
+// FatalHits are the lines of a kernel log that name a fatal event (panic, oops,
+// BUG, hung task...), whatever priority they were logged at.
+func FatalHits(text string) []FatalHit {
+	hits := []FatalHit{}
+	for _, line := range strings.Split(text, "\n") {
+		if k := detect.Classify(line); k != "" && detect.Fatal(k) {
+			hits = append(hits, FatalHit{Kind: k, Line: strings.TrimSpace(line)})
+		}
+	}
+	return hits
+}
+
 func CompareDmesg(job, device string, frozen FileRef, frozenText string, current FileRef, currentText string) *DmesgCompare {
 	d := &DmesgCompare{Schema: "maclab.dmesg-compare/2", Job: job, Device: device, Frozen: frozen, Current: current,
 		NewLines: nz(detect.NewLines(frozenText, currentText)), GoneLines: nz(detect.NewLines(currentText, frozenText)), FatalHits: []FatalHit{}}
-	for _, line := range strings.Split(currentText, "\n") {
-		if k := detect.Classify(line); k != "" && detect.Fatal(k) {
-			d.FatalHits = append(d.FatalHits, FatalHit{Kind: k, Line: strings.TrimSpace(line)})
-		}
-	}
+	d.FatalHits = append(d.FatalHits, FatalHits(currentText)...)
 	switch {
 	case len(d.FatalHits) > 0:
 		d.Disposition = "FATAL"

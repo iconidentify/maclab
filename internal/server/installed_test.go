@@ -246,6 +246,24 @@ func TestInstalledJob(t *testing.T) {
 	}
 	os.WriteFile(filepath.Join(fd, "omt-compare.json"), orig, 0o444)
 	unchanged("changed frozen copy")
+	// the job's omarchy-m-test report changed after the run: a pass turned into a fail
+	rp := filepath.Join(l.s.jobDir(j.ID), omtFile)
+	rep, _ := os.ReadFile(rp)
+	var rec2 map[string]any
+	json.Unmarshal(rep, &rec2)
+	for _, c := range rec2["checks"].([]any) {
+		if c := c.(map[string]any); c["status"] == "pass" {
+			c["status"] = "fail"
+			break
+		}
+	}
+	swapped, _ := json.Marshal(rec2)
+	os.WriteFile(rp, swapped, 0o644)
+	if resp, body := promote(); resp.StatusCode != 409 || !strings.Contains(body, "not the") {
+		t.Fatalf("promote with a changed report: %s %s", resp.Status, body)
+	}
+	os.WriteFile(rp, rep, 0o644)
+	unchanged("changed report")
 	// the new references can't be staged
 	bdir := filepath.Dir(l.s.omtBaselinePath("sim-mac"))
 	os.Chmod(bdir, 0o555)
@@ -338,11 +356,32 @@ func TestInstalledJobFailsClosedWithoutKernelLogs(t *testing.T) {
 		{"empty kernel log", logs(ok, "", str("")), "kernel.txt is empty"},
 		{"journalctl error text in an ok file", logs(ok, "Linux version x\n", str("\n[journalctl: exit status 1]\n")), "journalctl failed"},
 		{"an empty warning log is valid", logs(ok, "Linux version x\n", str("")), ""},
+		// the filtered warnings are empty, but the full kernel log has a fatal event
+		{"fatal only in the full kernel log", logs(ok, "Linux version x\n[   12.0] Unable to handle kernel NULL pointer dereference at virtual address 0000000000000008\n", str("")), "!unhealthy"},
+		{"bare Oops in the full kernel log", logs(ok, "Linux version x\n[   12.0] Oops: 0002 [#1] SMP\n", str("")), "!unhealthy"},
+		{"general protection fault in the full kernel log", logs(ok, "Linux version x\n[   12.0] general protection fault, probably for non-canonical address\n", str("")), "!unhealthy"},
+		{"double fault in the full kernel log", logs(ok, "Linux version x\n[   12.0] double fault: 0000 [#1] PREEMPT SMP\n", str("")), "!unhealthy"},
+		{"recursive fault in the full kernel log", logs(ok, "Linux version x\n[   12.0] Fixing recursive fault but reboot is needed!\n", str("")), "!unhealthy"},
+		{"bare Oops in the warnings too", logs(ok, "Linux version x\n[   12.0] Oops: 0002 [#1] SMP\n", str("Oops: 0002 [#1] SMP\n")), "!fatal-both"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			l, msha, _ := installedLab(t, nil)
 			l.sim.CollectHook = c.collect
 			j := l.run(api.JobSpec{InstalledManifest: msha, Holder: "tester"})
+			if c.want == "!fatal-both" {
+				l.expect(j, api.OutcomeUnhealthy)
+				if j.Result.Installed.Dmesg != "FATAL" || len(j.Result.Installed.KernelLogFatal) != 1 {
+					t.Fatalf("dmesg %q kernel_log_fatal %v", j.Result.Installed.Dmesg, j.Result.Installed.KernelLogFatal)
+				}
+				return
+			}
+			if c.want == "!unhealthy" {
+				l.expect(j, api.OutcomeUnhealthy)
+				if !strings.Contains(j.Summary, "kernel.txt") || len(j.Result.Installed.KernelLogFatal) != 1 || j.Result.Installed.Dmesg != "NONE_NEW" {
+					t.Fatalf("summary %q kernel_log_fatal %v dmesg %q", j.Summary, j.Result.Installed.KernelLogFatal, j.Result.Installed.Dmesg)
+				}
+				return
+			}
 			if c.want == "" {
 				l.expect(j, api.OutcomePass)
 				if j.Result.Installed.Dmesg != "NONE_NEW" {
@@ -439,5 +478,44 @@ func TestPublishDir(t *testing.T) {
 	// write-once is exclusive
 	if err := writeOnce(filepath.Join(dst, "a.json"), []byte("x")); err == nil {
 		t.Fatal("writeOnce replaced a file")
+	}
+}
+
+// A frozen copy that can't be made durable is not published.
+func TestPublishDirSyncFailures(t *testing.T) {
+	src := t.TempDir()
+	os.WriteFile(filepath.Join(src, "job.json"), []byte("frozen"), 0o644)
+	// the parent can't be opened to sync it (Darnell's reproduction)
+	root := t.TempDir()
+	os.Chmod(root, 0o300)
+	defer os.Chmod(root, 0o700)
+	if err := publishDir(src, filepath.Join(root, "published"), "job.json"); err == nil || !strings.Contains(err.Error(), "syncing") {
+		t.Fatalf("unopenable parent: %v", err)
+	}
+	os.Chmod(root, 0o700)
+	if left, _ := os.ReadDir(root); len(left) != 0 {
+		t.Fatalf("left behind: %v", left)
+	}
+	// the sync after the rename fails: nothing stays published
+	saved := syncDir
+	defer func() { syncDir = saved }()
+	calls := 0
+	syncDir = func(p string) error {
+		calls++
+		if calls == 3 {
+			return errors.New("injected sync failure")
+		}
+		return saved(p)
+	}
+	root2 := t.TempDir()
+	dst := filepath.Join(root2, "published")
+	if err := publishDir(src, dst, "job.json"); err == nil || !strings.Contains(err.Error(), "moved aside") {
+		t.Fatalf("failed sync after rename: %v", err)
+	}
+	if _, err := os.Lstat(dst); err == nil {
+		t.Fatal("an unsynced copy stayed published")
+	}
+	if left, _ := os.ReadDir(root2); len(left) != 0 {
+		t.Fatalf("left behind: %v", left)
 	}
 }

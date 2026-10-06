@@ -40,7 +40,7 @@ type rule struct {
 
 var rules = []rule{
 	{Panic, regexp.MustCompile(`Kernel panic - not syncing`)},
-	{Oops, regexp.MustCompile(`Internal error: Oops|Unable to handle kernel (NULL pointer|paging request)`)},
+	{Oops, regexp.MustCompile(`Internal error: Oops|Unable to handle kernel (NULL pointer|paging request)|(?i:\bOops:|\bgeneral protection fault\b|\bdouble fault\b|Fixing recursive fault but reboot is needed)`)},
 	{SoftLockup, regexp.MustCompile(`BUG: soft lockup`)},
 	{HardLockup, regexp.MustCompile(`(?i)hard LOCKUP`)},
 	{RCUStall, regexp.MustCompile(`rcu: INFO: rcu_\w+ (self-)?detected stall|rcu_\w+ kthread starved`)},

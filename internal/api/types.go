@@ -339,10 +339,11 @@ type InstalledResult struct {
 	Release        string            `json:"release"`
 	ManifestSHA256 string            `json:"manifest_sha256"`
 	EntrySHA256    string            `json:"installer_entry_sha256"`
-	Before         *TestResult       `json:"before,omitempty"` // identity-before: not one of Tests
-	Verdicts       map[string]string `json:"verdicts"`         // phase -> MATCH/MISMATCH/INCOMPLETE
-	OMT            string            `json:"omt,omitempty"`    // NO_REGRESSION or REGRESSION
-	Dmesg          string            `json:"dmesg,omitempty"`  // NONE_NEW, REVIEW_REQUIRED or FATAL
+	Before         *TestResult       `json:"before,omitempty"`           // identity-before: not one of Tests
+	Verdicts       map[string]string `json:"verdicts"`                   // phase -> MATCH/MISMATCH/INCOMPLETE
+	OMT            string            `json:"omt,omitempty"`              // NO_REGRESSION or REGRESSION
+	Dmesg          string            `json:"dmesg,omitempty"`            // NONE_NEW, REVIEW_REQUIRED or FATAL
+	KernelLogFatal []string          `json:"kernel_log_fatal,omitempty"` // fatal events in the full kernel log (boot0/kernel.txt), at any priority
 	Evidence       []string          `json:"evidence,omitempty"`
 	Frozen         string            `json:"frozen_copy,omitempty"`
 }

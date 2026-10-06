@@ -346,14 +346,20 @@ func (r *jobRun) execute(ctx context.Context) (string, string) {
 	var logsErr error
 	if r.ir != nil {
 		// an installed job is judged on its kernel log: without it, it can't pass
-		if got, err := kernelLogs(r.s.jobDir(j.ID), files, collectErr); err != nil {
+		if kern, warn, err := kernelLogs(r.s.jobDir(j.ID), files, collectErr); err != nil {
 			logsErr = err
 			r.ir.fail("kernel log: %v", err)
 		} else {
-			dc := r.ir.dmesg(got)
+			dc := r.ir.dmesg(warn)
 			newLines = dc.NewLines
 			for _, h := range dc.FatalHits {
 				dmesgFatal = append(dmesgFatal, h.Kind+": "+h.Line)
+			}
+			// the warning filter goes by priority; a fatal event logged lower
+			// must still fail the job, so the full kernel log is checked too
+			for _, h := range installed.FatalHits(string(kern)) {
+				r.ir.res.KernelLogFatal = append(r.ir.res.KernelLogFatal, h.Kind+": "+h.Line)
+				dmesgFatal = append(dmesgFatal, "kernel.txt "+h.Kind+": "+h.Line)
 			}
 		}
 		r.s.updateJob(j, func(j *api.Job) { j.Result.Installed = &r.ir.res })
