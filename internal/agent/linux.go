@@ -230,13 +230,28 @@ func (l *Linux) BootOnce(entry string) error {
 	return b.arm(entry)
 }
 
+// Collect saves the boot's logs. collect-status.txt says, for each file,
+// "<file> ok" or why it isn't valid evidence (the command failed, or the file
+// couldn't be written), so an empty log is never mistaken for a clean one.
 func (l *Linux) Collect(ctx context.Context, boot, outDir string) error {
+	var status strings.Builder
+	save := func(name string, out []byte, cmdErr error, cmd string) {
+		if cmdErr != nil {
+			out = append(out, []byte("\n["+cmd+": "+cmdErr.Error()+"]\n")...)
+		}
+		werr := os.WriteFile(filepath.Join(outDir, name), out, 0o644)
+		switch {
+		case werr != nil:
+			fmt.Fprintf(&status, "%s write failed: %v\n", name, werr)
+		case cmdErr != nil:
+			fmt.Fprintf(&status, "%s %s failed: %v\n", name, cmd, cmdErr)
+		default:
+			fmt.Fprintf(&status, "%s ok\n", name)
+		}
+	}
 	run := func(name string, args ...string) {
 		out, err := exec.CommandContext(ctx, "journalctl", args...).CombinedOutput()
-		if err != nil {
-			out = append(out, []byte("\n[journalctl: "+err.Error()+"]\n")...)
-		}
-		os.WriteFile(filepath.Join(outDir, name), out, 0o644)
+		save(name, out, err, "journalctl")
 	}
 	run("journal.txt", "-b", boot, "-o", "short-monotonic", "--no-pager")
 	run("kernel.txt", "-k", "-b", boot, "-o", "short-monotonic", "--no-pager")
@@ -251,13 +266,10 @@ func (l *Linux) Collect(ctx context.Context, boot, outDir string) error {
 			"systemd-critical-chain.txt": {"critical-chain", "--no-pager"},
 		} {
 			out, err := exec.CommandContext(ctx, "systemd-analyze", args...).CombinedOutput()
-			if err != nil {
-				out = append(out, []byte("\n[systemd-analyze: "+err.Error()+"]\n")...)
-			}
-			os.WriteFile(filepath.Join(outDir, name), out, 0o644)
+			save(name, out, err, "systemd-analyze")
 		}
 	}
-	return nil
+	return os.WriteFile(filepath.Join(outDir, "collect-status.txt"), []byte(status.String()), 0o644)
 }
 
 // dirSize is the total size of the regular files under dir.

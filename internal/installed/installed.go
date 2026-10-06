@@ -215,6 +215,7 @@ type Entry struct {
 	EntrySHA256      string             `json:"entry_sha256,omitempty"` // sha256 of entry_lines joined with "\n", plus "\n"
 	UKIFile          string             `json:"uki_file,omitempty"`
 	UKISHA256        string             `json:"uki_sha256,omitempty"`
+	UKIBlake2b       string             `json:"uki_blake2b,omitempty"` // measured BLAKE2b-512 of the UKI: what the path's #pin must name
 	UKISections      map[string]Section `json:"uki_sections,omitempty"`
 	LimineConfSHA256 string             `json:"limine_conf_sha256,omitempty"`
 }
@@ -297,12 +298,26 @@ func FreezeEntry(o *Observed, m *Manifest) (*InstallerEntry, error) {
 		return nil, fmt.Errorf("%s: the entry's cmdline differs from the UKI's built-in .cmdline", o.Device)
 	case !reEntryPath.MatchString(e.Path):
 		return nil, fmt.Errorf("%s: installer entry path %q is not a hash-pinned boot():/….efi#<blake2b>", o.Device, e.Path)
+	case !reBlake2b.MatchString(e.UKIBlake2b) || PathPin(e.Path) != e.UKIBlake2b:
+		return nil, fmt.Errorf("%s: the path pins BLAKE2b %s, but the UKI measures %q", o.Device, PathPin(e.Path), e.UKIBlake2b)
 	}
 	return &InstallerEntry{Schema: "maclab.installer-entry/1", Device: o.Device, Release: m.Release,
 		CapturedBootID: o.Running.BootID, CapturedTime: o.Time, Entry: e}, nil
 }
 
-var reEntryPath = regexp.MustCompile(`^boot\(\):/[^\s#]+\.efi#[0-9a-f]{128}$`)
+var (
+	reEntryPath = regexp.MustCompile(`^boot\(\):/[^\s#]+\.efi#[0-9a-f]{128}$`)
+	reBlake2b   = regexp.MustCompile(`^[0-9a-f]{128}$`)
+)
+
+// PathPin is the BLAKE2b a Limine path pins its file to (after "#"), or "".
+func PathPin(path string) string {
+	_, pin, ok := strings.Cut(path, "#")
+	if !ok {
+		return ""
+	}
+	return pin
+}
 
 // EntryDigest is sha256 over the entry's limine.conf lines joined with "\n", plus a final "\n".
 func EntryDigest(lines []string) string {
@@ -439,14 +454,16 @@ func Compare(phase string, raw []byte, m *Manifest, manifestSHA string, payload 
 		for _, s := range []string{".linux", ".initrd", ".cmdline", ".uname"} {
 			secOK[s] = ie.UKISections[s].SHA256 != "" && ie.UKISections[s].SHA256 == e.UKISections[s].SHA256
 		}
-		match := ie.Found && ie.Path == e.Path && ie.Protocol == e.Protocol && ie.UKISHA256 == e.UKISHA256 &&
+		// the path's #pin must be the UKI's measured BLAKE2b, now and when frozen
+		pinOK := reBlake2b.MatchString(ie.UKIBlake2b) && ie.UKIBlake2b == e.UKIBlake2b && PathPin(ie.Path) == ie.UKIBlake2b
+		match := ie.Found && ie.Path == e.Path && ie.Protocol == e.Protocol && ie.UKISHA256 == e.UKISHA256 && pinOK &&
 			ie.EntrySHA256 == e.EntrySHA256 && EntryDigest(ie.EntryLines) == ie.EntrySHA256 &&
 			secOK[".linux"] && secOK[".initrd"] && secOK[".cmdline"] && secOK[".uname"] &&
 			ie.UKISections[".linux"].SHA256 == m.Kernel.VmlinuzSHA256
 		add(Check{ID: "installer_entry",
-			Expected: map[string]any{"path": e.Path, "protocol": e.Protocol, "uki_sha256": e.UKISHA256, "entry_sha256": e.EntrySHA256, ".linux": m.Kernel.VmlinuzSHA256},
-			Observed: map[string]any{"found": ie.Found, "path": ie.Path, "protocol": ie.Protocol, "uki_sha256": ie.UKISHA256, "entry_sha256": ie.EntrySHA256},
-			Detail:   map[string]any{"sections_match": secOK}, Match: match})
+			Expected: map[string]any{"path": e.Path, "protocol": e.Protocol, "uki_sha256": e.UKISHA256, "uki_blake2b": e.UKIBlake2b, "entry_sha256": e.EntrySHA256, ".linux": m.Kernel.VmlinuzSHA256},
+			Observed: map[string]any{"found": ie.Found, "path": ie.Path, "protocol": ie.Protocol, "uki_sha256": ie.UKISHA256, "uki_blake2b": ie.UKIBlake2b, "entry_sha256": ie.EntrySHA256},
+			Detail:   map[string]any{"sections_match": secOK, "path_pin_is_measured_blake2b": pinOK}, Match: match})
 		add(Check{ID: "initramfs_stable", Expected: e.UKISections[".initrd"].SHA256, Observed: ie.UKISections[".initrd"].SHA256,
 			Match: ie.UKISections[".initrd"].SHA256 != "" && ie.UKISections[".initrd"].SHA256 == e.UKISections[".initrd"].SHA256})
 	}

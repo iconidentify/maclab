@@ -21,6 +21,8 @@ const (
 
 var installerTokens = []string{"root=UUID=x", "rw", "quiet", "splash"}
 
+var ukiB2 = strings.Repeat("b2", 64) // the UKI's measured BLAKE2b-512, which its path pins
+
 // fixture builds a consistent manifest, payload, frozen entry and a matching observation.
 func fixture(t *testing.T) (*Manifest, map[string]string, *InstallerEntry, func(phase, job, bootID, cmdline string) map[string]any) {
 	t.Helper()
@@ -38,9 +40,10 @@ func fixture(t *testing.T) (*Manifest, map[string]string, *InstallerEntry, func(
 		t.Fatal(err)
 	}
 	pl, _ := ParsePayload([]byte(payload))
-	lines := []string{"  //linux-aurora", "  protocol: efi", "  path: boot():/EFI/Linux/omarchy_linux-aurora.efi#abc", "  cmdline: " + strings.Join(installerTokens, " ")}
-	entry := Entry{Found: true, Name: "Omarchy / linux-aurora", Protocol: "efi", Path: "boot():/EFI/Linux/omarchy_linux-aurora.efi#abc",
-		CmdlineTokens: installerTokens, EntryLines: lines, EntrySHA256: EntryDigest(lines), UKISHA256: uki,
+	path := "boot():/EFI/Linux/omarchy_linux-aurora.efi#" + ukiB2
+	lines := []string{"  //linux-aurora", "  protocol: efi", "  path: " + path, "  cmdline: " + strings.Join(installerTokens, " ")}
+	entry := Entry{Found: true, Name: "Omarchy / linux-aurora", Protocol: "efi", Path: path,
+		CmdlineTokens: installerTokens, EntryLines: lines, EntrySHA256: EntryDigest(lines), UKISHA256: uki, UKIBlake2b: ukiB2,
 		UKISections: map[string]Section{".linux": {SHA256: vml}, ".initrd": {SHA256: ird}, ".cmdline": {SHA256: "c"}, ".uname": {SHA256: "u", Text: krel}}}
 	e := &InstallerEntry{Schema: "maclab.installer-entry/1", Device: "mac", Release: "12.0", Entry: entry}
 	obs := func(phase, job, bootID, cmdline string) map[string]any {
@@ -203,5 +206,50 @@ func TestCompareDmesg(t *testing.T) {
 	d = CompareDmesg("j", "mac", FileRef{}, "[1] a: x\n[2] b: y\n", FileRef{}, "[5] a: x\n")
 	if d.Disposition != "NONE_NEW" || len(d.GoneLines) != 1 {
 		t.Fatalf("gone line: %+v", d)
+	}
+}
+
+// The path's #pin must be the UKI's measured BLAKE2b; its SHA256 can't prove that.
+func TestComparePathPinMustBeMeasuredBlake2b(t *testing.T) {
+	for name, change := range map[string]func(e map[string]any){
+		"UKI no longer measures the pinned BLAKE2b": func(e map[string]any) { e["uki_blake2b"] = strings.Repeat("cd", 64) },
+		"no BLAKE2b measured":                       func(e map[string]any) { delete(e, "uki_blake2b") },
+	} {
+		m, pl, e, obs := fixture(t)
+		o := obs(PhaseBooted, "j1", "b-1", Cmdline(installerTokens, "j1", false))
+		ent := map[string]any{}
+		b, _ := json.Marshal(o["installer_entry"])
+		json.Unmarshal(b, &ent)
+		change(ent)
+		o["installer_entry"] = ent
+		raw, _ := json.Marshal(o)
+		id, err := Compare(PhaseBooted, raw, m, "msha", pl, e, "esha", false, nil)
+		if err != nil || id.Verdict != "MISMATCH" || !strings.Contains(strings.Join(id.Mismatches, " "), "installer_entry") {
+			t.Errorf("%s: %v %+v", name, err, id)
+		}
+	}
+	// a frozen entry whose measured BLAKE2b doesn't match the observation's
+	m, pl, e, obs := fixture(t)
+	e.UKIBlake2b = strings.Repeat("ef", 64)
+	raw, _ := json.Marshal(obs(PhaseBooted, "j1", "b-1", Cmdline(installerTokens, "j1", false)))
+	if id, _ := Compare(PhaseBooted, raw, m, "msha", pl, e, "esha", false, nil); id.Verdict != "MISMATCH" {
+		t.Errorf("frozen BLAKE2b differs: %s", id.Verdict)
+	}
+}
+
+func TestFreezeEntryChecksPin(t *testing.T) {
+	m, _, e, _ := fixture(t)
+	ent := e.Entry
+	ent.UKISections = map[string]Section{".linux": {SHA256: vml}, ".initrd": {SHA256: ird},
+		".cmdline": {SHA256: "c", Text: strings.Join(installerTokens, " ")}, ".uname": {SHA256: "u", Text: krel}}
+	o := &Observed{Device: "mac", InstallerEntry: ent}
+	if _, err := FreezeEntry(o, m); err != nil {
+		t.Fatalf("a matching pin: %v", err)
+	}
+	for name, b2 := range map[string]string{"pin is not the measured BLAKE2b": strings.Repeat("cd", 64), "not measured": ""} {
+		o.InstallerEntry.UKIBlake2b = b2
+		if _, err := FreezeEntry(o, m); err == nil || !strings.Contains(err.Error(), "BLAKE2b") {
+			t.Errorf("%s: %v", name, err)
+		}
 	}
 }

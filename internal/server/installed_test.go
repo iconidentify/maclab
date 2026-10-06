@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -28,6 +29,8 @@ const (
 	tIrd  = "8888888888888888888888888888888888888888888888888888888888888888"
 	tMtr  = "9999999999999999999999999999999999999999999999999999999999999999"
 )
+
+var tB2 = strings.Repeat("b2", 64) // the UKI's measured BLAKE2b-512, which its path pins
 
 func (l *lab) post(path string, body any) (*http.Response, string) {
 	l.t.Helper()
@@ -98,9 +101,10 @@ func installedLab(t *testing.T, tamper func(phase string, o map[string]any)) (*l
 	}
 
 	tokens := []string{"root=UUID=sim", "rw", "quiet", "splash"}
-	lines := []string{"  //linux-aurora", "  protocol: efi", "  path: boot():/EFI/Linux/omarchy_linux-aurora.efi#abc", "  cmdline: root=UUID=sim rw quiet splash"}
-	entry := installed.Entry{Found: true, Name: "Omarchy / linux-aurora", Protocol: "efi", Path: "boot():/EFI/Linux/omarchy_linux-aurora.efi#abc",
-		Cmdline: strings.Join(tokens, " "), CmdlineTokens: tokens, EntryLines: lines, EntrySHA256: installed.EntryDigest(lines), UKISHA256: tUKI,
+	path := "boot():/EFI/Linux/omarchy_linux-aurora.efi#" + tB2
+	lines := []string{"  //linux-aurora", "  protocol: efi", "  path: " + path, "  cmdline: root=UUID=sim rw quiet splash"}
+	entry := installed.Entry{Found: true, Name: "Omarchy / linux-aurora", Protocol: "efi", Path: path,
+		Cmdline: strings.Join(tokens, " "), CmdlineTokens: tokens, EntryLines: lines, EntrySHA256: installed.EntryDigest(lines), UKISHA256: tUKI, UKIBlake2b: tB2,
 		UKISections: map[string]installed.Section{".linux": {SHA256: tVml}, ".initrd": {SHA256: tIrd}, ".cmdline": {SHA256: "cc"}, ".uname": {SHA256: "uu", Text: tKrel}}}
 	eb, _ := json.MarshalIndent(installed.InstallerEntry{Schema: "maclab.installer-entry/1", Device: "sim-mac", Release: "9.9", Entry: entry}, "", "  ")
 	os.MkdirAll(filepath.Join(dir, "installer-entry"), 0o755)
@@ -184,6 +188,25 @@ func TestInstalledJob(t *testing.T) {
 			t.Errorf("frozen copy %s: %v", f, err)
 		}
 	}
+	// the collected logs are the job's, and the compared error lines are the collected ones
+	for _, f := range []string{"boot0/collect-status.txt", "boot0/kernel.txt", "boot0/dmesg-errors.txt"} {
+		if !slices.Contains(j.Result.Logs, f) {
+			t.Fatalf("result.logs lacks %s: %v", f, j.Result.Logs)
+		}
+	}
+	c0, _ := os.ReadFile(filepath.Join(l.s.jobDir(j.ID), "boot0", "dmesg-errors.txt"))
+	c1, _ := os.ReadFile(filepath.Join(l.s.jobDir(j.ID), "installed", "dmesg-errors.txt"))
+	if len(c0) == 0 || !bytes.Equal(c0, c1) {
+		t.Fatalf("boot0 and installed dmesg-errors.txt differ")
+	}
+	// the job's evidence and its frozen copy are the same bytes, and record the final pass
+	jb, _ := os.ReadFile(filepath.Join(l.s.jobDir(j.ID), "installed", "job.json"))
+	fb, _ := os.ReadFile(filepath.Join(l.s.frozenDir("9.9"), "installed", "sim-mac", j.ID, "job.json"))
+	var rec api.Job
+	if !bytes.Equal(jb, fb) || json.Unmarshal(jb, &rec) != nil || rec.State != api.JobDone || rec.Outcome != api.OutcomePass ||
+		rec.Result.Installed.Frozen == "" || ir.Frozen != rec.Result.Installed.Frozen {
+		t.Fatalf("job.json %s/%s frozen %q (store %q), copies equal %v", rec.State, rec.Outcome, rec.Result.Installed.Frozen, ir.Frozen, bytes.Equal(jb, fb))
+	}
 	// nothing promoted
 	if got := l.s.dev("sim-mac").snapshot().KnownGood; got != kg {
 		t.Fatalf("known-good moved: %s -> %s", kg, got)
@@ -199,9 +222,56 @@ func TestInstalledJob(t *testing.T) {
 	if resp, _ := l.post("/api/installed/9.9/promote", map[string]any{"device": "sim-mac", "job": j.ID}); resp.StatusCode != 400 {
 		t.Fatalf("promote without accepted_by: %s", resp.Status)
 	}
-	resp, body := l.post("/api/installed/9.9/promote", map[string]any{"device": "sim-mac", "job": j.ID, "accepted_by": "dave"})
+	promote := func() (*http.Response, string) {
+		return l.post("/api/installed/9.9/promote", map[string]any{"device": "sim-mac", "job": j.ID, "accepted_by": "dave"})
+	}
+	unchanged := func(why string) {
+		t.Helper()
+		ref, _ := os.ReadFile(l.s.omtBaselinePath("sim-mac"))
+		if got := l.s.dev("sim-mac").snapshot().KnownGood; got != kg || !bytes.Equal(ref, refBefore) {
+			t.Fatalf("%s: known-good %s, reference changed %v", why, got, !bytes.Equal(ref, refBefore))
+		}
+		if left, _ := filepath.Glob(filepath.Join(filepath.Dir(l.s.omtBaselinePath("sim-mac")), "*.promote-*")); len(left) > 0 {
+			t.Fatalf("%s: staged files left behind: %v", why, left)
+		}
+	}
+	// a frozen copy that no longer matches the job's evidence
+	fd := filepath.Join(l.s.frozenDir("9.9"), "installed", "sim-mac", j.ID)
+	os.Chmod(fd, 0o755)
+	os.Chmod(filepath.Join(fd, "omt-compare.json"), 0o644)
+	orig, _ := os.ReadFile(filepath.Join(fd, "omt-compare.json"))
+	os.WriteFile(filepath.Join(fd, "omt-compare.json"), append(orig, ' '), 0o444)
+	if resp, body := promote(); resp.StatusCode != 409 || !strings.Contains(body, "frozen copy") {
+		t.Fatalf("promote with a changed frozen copy: %s %s", resp.Status, body)
+	}
+	os.WriteFile(filepath.Join(fd, "omt-compare.json"), orig, 0o444)
+	unchanged("changed frozen copy")
+	// the new references can't be staged
+	bdir := filepath.Dir(l.s.omtBaselinePath("sim-mac"))
+	os.Chmod(bdir, 0o555)
+	if resp, body := promote(); resp.StatusCode != 500 || !strings.Contains(body, "nothing was changed") {
+		t.Fatalf("promote with unwritable baselines: %s %s", resp.Status, body)
+	}
+	os.Chmod(bdir, 0o755)
+	unchanged("unwritable baselines")
+	// the ledger can't be written
+	ledger := filepath.Join(l.s.frozenDir("9.9"), "promotions.log")
+	os.WriteFile(ledger, nil, 0o444)
+	if resp, body := promote(); resp.StatusCode != 500 || !strings.Contains(body, "recording the promotion") {
+		t.Fatalf("promote with an unwritable ledger: %s %s", resp.Status, body)
+	}
+	os.Remove(ledger)
+	unchanged("unwritable ledger")
+
+	resp, body := promote()
 	if resp.StatusCode != 200 || l.s.dev("sim-mac").snapshot().KnownGood != tKrel {
 		t.Fatalf("promote: %s %s", resp.Status, body)
+	}
+	if resp, _ := promote(); resp.StatusCode != 409 {
+		t.Fatalf("second promote: %s", resp.Status)
+	}
+	if b, err := os.ReadFile(l.s.omtBaselinePath("sim-mac") + ".before-" + j.ID); err != nil || !bytes.Equal(b, refBefore) {
+		t.Fatalf("the previous reference was not kept: %v", err)
 	}
 	if b, _ := os.ReadFile(filepath.Join(l.s.frozenDir("9.9"), "promotions.log")); !strings.Contains(string(b), j.ID+"\t"+tKrel+"\taccepted-by=dave") {
 		t.Fatalf("promotions.log: %q", b)
@@ -233,5 +303,141 @@ func TestInstalledJobStopsBeforeBootOnWrongState(t *testing.T) {
 	l.expect(j, api.OutcomeTestsFailed)
 	if !strings.Contains(j.Summary, "before boot") || j.Result.Booted || l.s.dev("sim-mac").snapshot().BootID != boot0 {
 		t.Fatalf("summary %q booted %v", j.Summary, j.Result.Booted)
+	}
+}
+
+// Regression rows for the installed-mode audit: an installed job that can't
+// show its kernel log or keep its evidence is never a pass.
+func TestInstalledJobFailsClosedWithoutKernelLogs(t *testing.T) {
+	logs := func(status, kernel string, dmesg *string) func(string, string) error {
+		return func(_, out string) error {
+			if status != "" {
+				os.WriteFile(filepath.Join(out, "collect-status.txt"), []byte(status), 0o644)
+			}
+			os.WriteFile(filepath.Join(out, "kernel.txt"), []byte(kernel), 0o644)
+			if dmesg != nil {
+				os.WriteFile(filepath.Join(out, "dmesg-errors.txt"), []byte(*dmesg), 0o644)
+			}
+			return nil
+		}
+	}
+	ok := "kernel.txt ok\ndmesg-errors.txt ok\n"
+	str := func(s string) *string { return &s }
+	for _, c := range []struct {
+		name    string
+		collect func(boot, out string) error
+		want    string // "" means the job passes
+	}{
+		{"transport failure", func(string, string) error { return errors.New("injected collector transport failure") }, "collecting logs failed"},
+		{"no collect-status.txt (agent before 0.7.1)", logs("", "Linux version x\n", str("")), "boot0/collect-status.txt was not collected"},
+		{"journalctl failed", logs("kernel.txt ok\ndmesg-errors.txt journalctl failed: exit status 1\n", "Linux version x\n", str("")), "dmesg-errors.txt is not valid evidence: journalctl failed"},
+		{"write failed", logs("kernel.txt write failed: no space left on device\ndmesg-errors.txt ok\n", "", str("")), "kernel.txt is not valid evidence: write failed"},
+		{"no dmesg-errors.txt", logs(ok, "Linux version x\n", nil), "boot0/dmesg-errors.txt was not collected"},
+		{"contradictory status", logs(ok+"dmesg-errors.txt journalctl failed: exit status 1\n", "Linux version x\n", str("")), "reports it 2 times"},
+		{"status missing a log", logs("kernel.txt ok\n", "Linux version x\n", str("")), "doesn't report it"},
+		{"empty kernel log", logs(ok, "", str("")), "kernel.txt is empty"},
+		{"journalctl error text in an ok file", logs(ok, "Linux version x\n", str("\n[journalctl: exit status 1]\n")), "journalctl failed"},
+		{"an empty warning log is valid", logs(ok, "Linux version x\n", str("")), ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			l, msha, _ := installedLab(t, nil)
+			l.sim.CollectHook = c.collect
+			j := l.run(api.JobSpec{InstalledManifest: msha, Holder: "tester"})
+			if c.want == "" {
+				l.expect(j, api.OutcomePass)
+				if j.Result.Installed.Dmesg != "NONE_NEW" {
+					t.Fatalf("dmesg %q", j.Result.Installed.Dmesg)
+				}
+				return
+			}
+			l.expect(j, api.OutcomeInfra)
+			if !strings.Contains(j.Summary, c.want) || j.Result.Installed.Dmesg != "" {
+				t.Fatalf("summary %q dmesg %q", j.Summary, j.Result.Installed.Dmesg)
+			}
+			// the frozen copy is complete, and records the failure, not a pass
+			var rec api.Job
+			b, err := os.ReadFile(filepath.Join(l.s.frozenDir("9.9"), "installed", "sim-mac", j.ID, "job.json"))
+			if err != nil || json.Unmarshal(b, &rec) != nil || rec.Outcome != api.OutcomeInfra || rec.State != api.JobDone {
+				t.Fatalf("frozen job.json: %v %s/%s", err, rec.State, rec.Outcome)
+			}
+			if resp, _ := l.post("/api/installed/9.9/promote", map[string]any{"device": "sim-mac", "job": j.ID, "accepted_by": "dave"}); resp.StatusCode != 409 {
+				t.Fatalf("promoting a job without its kernel log: %s", resp.Status)
+			}
+		})
+	}
+}
+
+func TestInstalledJobFailsClosedWithoutFrozenCopy(t *testing.T) {
+	var l *lab
+	l, msha, _ := installedLab(t, func(phase string, o map[string]any) {
+		if phase == installed.PhaseAfter { // something in the way of the frozen copy
+			if err := os.WriteFile(filepath.Join(l.s.frozenDir("9.9"), "installed"), []byte("obstruction"), 0o444); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+	j := l.run(api.JobSpec{InstalledManifest: msha, Holder: "tester"})
+	l.expect(j, api.OutcomeInfra)
+	if !strings.Contains(j.Summary, "frozen copy") || j.Result.Installed.Frozen != "" {
+		t.Fatalf("summary %q frozen %q", j.Summary, j.Result.Installed.Frozen)
+	}
+	var rec api.Job
+	b, _ := os.ReadFile(filepath.Join(l.s.jobDir(j.ID), "installed", "job.json"))
+	if json.Unmarshal(b, &rec) != nil || rec.Outcome != api.OutcomeInfra {
+		t.Fatalf("the job's own job.json says %q", rec.Outcome)
+	}
+}
+
+func TestInstalledJobFailsClosedOnEvidenceWriteError(t *testing.T) {
+	var l *lab
+	var id string
+	l, msha, _ := installedLab(t, func(phase string, o map[string]any) {
+		if phase == installed.PhaseAfter { // installed/ stops being writable before identity-after is merged
+			id = o["job"].(string)
+			os.Chmod(filepath.Join(l.s.jobDir(id), "installed"), 0o555)
+		}
+	})
+	j := l.run(api.JobSpec{InstalledManifest: msha, Holder: "tester"})
+	os.Chmod(filepath.Join(l.s.jobDir(id), "installed"), 0o755)
+	l.expect(j, api.OutcomeInfra)
+	if !strings.Contains(j.Summary, "writing installed/identity-after.json") || j.Result.Installed.Frozen != "" {
+		t.Fatalf("summary %q frozen %q", j.Summary, j.Result.Installed.Frozen)
+	}
+	if _, err := os.Stat(filepath.Join(l.s.frozenDir("9.9"), "installed", "sim-mac", j.ID, "job.json")); err == nil {
+		t.Fatal("the frozen store has a job.json for a job whose evidence is incomplete")
+	}
+}
+
+func TestPublishDir(t *testing.T) {
+	src, root := t.TempDir(), t.TempDir()
+	for n, b := range map[string]string{"a.json": "a", "b.txt": "b", "job.json": "j"} {
+		os.WriteFile(filepath.Join(src, n), []byte(b), 0o644)
+	}
+	dst := filepath.Join(root, "installed", "mac", "j1")
+	if err := publishDir(src, dst, "job.json"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sameFiles(src, dst); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := os.Stat(filepath.Join(dst, "a.json")); st.Mode().Perm() != 0o444 {
+		t.Fatalf("mode %v", st.Mode())
+	}
+	// an existing destination is refused, not trusted or merged into
+	if err := publishDir(src, dst, "job.json"); err == nil || !strings.Contains(err.Error(), "append-only") {
+		t.Fatalf("second publish: %v", err)
+	}
+	// a source that can't be read leaves no destination and no partial directory
+	os.Chmod(filepath.Join(src, "b.txt"), 0)
+	dst2 := filepath.Join(root, "installed", "mac", "j2")
+	if err := publishDir(src, dst2, "job.json"); err == nil {
+		t.Fatal("published an unreadable source")
+	}
+	if left, _ := os.ReadDir(filepath.Dir(dst2)); len(left) != 1 {
+		t.Fatalf("left behind: %v", left)
+	}
+	// write-once is exclusive
+	if err := writeOnce(filepath.Join(dst, "a.json"), []byte("x")); err == nil {
+		t.Fatal("writeOnce replaced a file")
 	}
 }

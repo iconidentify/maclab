@@ -27,15 +27,18 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/iconidentify/maclab/internal/api"
 	"github.com/iconidentify/maclab/internal/installed"
 )
 
-const installedMinAgent = "0.7.0"
+const installedMinAgent = "0.7.1" // collect-status.txt
 
 var reRelease = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z._-]*$`)
 
@@ -248,6 +251,15 @@ type installedRun struct {
 	booted  *installed.Identity
 	res     api.InstalledResult
 	scripts map[string]string // phase -> script artifact sha
+	errs    []string          // evidence that could not be collected or written: the job can't pass
+}
+
+// fail records evidence the job is missing. An installed job with any of these
+// is not a pass, whatever its tests said.
+func (ir *installedRun) fail(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	ir.errs = append(ir.errs, msg)
+	ir.r.ev("installed: %s", msg)
 }
 
 func (r *jobRun) newInstalled() (*installedRun, error) {
@@ -288,9 +300,25 @@ func (ir *installedRun) stageArgs() *api.InstalledStage {
 func (ir *installedRun) evDir() string { return filepath.Join(ir.r.s.jobDir(ir.r.j.ID), "installed") }
 
 func (ir *installedRun) write(name string, v any) {
-	os.MkdirAll(ir.evDir(), 0o755)
-	b, _ := json.MarshalIndent(v, "", "  ")
-	os.WriteFile(filepath.Join(ir.evDir(), name), append(b, '\n'), 0o644)
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err == nil {
+		err = ir.writeRaw(name, append(b, '\n'))
+	}
+	if err != nil {
+		ir.fail("writing installed/%s: %v", name, err)
+		return
+	}
+	ir.addEvidence(name)
+}
+
+func (ir *installedRun) writeRaw(name string, b []byte) error {
+	if err := os.MkdirAll(ir.evDir(), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(ir.evDir(), name), b, 0o644)
+}
+
+func (ir *installedRun) addEvidence(name string) {
 	rel := "installed/" + name
 	for _, e := range ir.res.Evidence {
 		if e == rel {
@@ -373,11 +401,64 @@ func (ir *installedRun) omt(tr *api.TestResult, res *api.OMTResult, report []byt
 	}
 }
 
+// kernelLogs returns the test boot's kernel error lines, or why the job can't
+// be judged without them: a collection that failed, a file that didn't arrive
+// or can't be read, an empty kernel log, or journalctl reporting an error.
+func kernelLogs(jobDir string, files []string, collectErr error) ([]byte, error) {
+	if collectErr != nil {
+		return nil, fmt.Errorf("collecting logs failed: %v", collectErr)
+	}
+	read := func(name string) ([]byte, error) {
+		if !slices.Contains(files, "boot0/"+name) {
+			return nil, fmt.Errorf("boot0/%s was not collected", name)
+		}
+		b, err := os.ReadFile(filepath.Join(jobDir, "boot0", name))
+		if err != nil {
+			return nil, err
+		}
+		if bytes.Contains(b, []byte("\n[journalctl: ")) {
+			return nil, fmt.Errorf("boot0/%s: journalctl failed: %s", name, lastLine(string(b)))
+		}
+		return b, nil
+	}
+	st, err := read("collect-status.txt")
+	if err != nil {
+		return nil, err
+	}
+	// exactly one status line per required log, and it says ok
+	for _, name := range []string{"kernel.txt", "dmesg-errors.txt"} {
+		var lines []string
+		for _, l := range strings.Split(string(st), "\n") {
+			if strings.HasPrefix(l, name+" ") {
+				lines = append(lines, strings.TrimPrefix(l, name+" "))
+			}
+		}
+		switch {
+		case len(lines) == 0:
+			return nil, fmt.Errorf("boot0/%s is not valid evidence: collect-status.txt doesn't report it", name)
+		case len(lines) > 1:
+			return nil, fmt.Errorf("boot0/%s is not valid evidence: collect-status.txt reports it %d times", name, len(lines))
+		case lines[0] != "ok":
+			return nil, fmt.Errorf("boot0/%s is not valid evidence: %s", name, lines[0])
+		}
+	}
+	kern, err := read("kernel.txt")
+	if err != nil {
+		return nil, err
+	}
+	if len(bytes.TrimSpace(kern)) == 0 {
+		return nil, errors.New("boot0/kernel.txt is empty: the journal has no kernel log for the test boot")
+	}
+	return read("dmesg-errors.txt")
+}
+
 // dmesg compares the run's kernel error lines with the frozen ones.
 func (ir *installedRun) dmesg(got []byte) *installed.DmesgCompare {
-	os.MkdirAll(ir.evDir(), 0o755)
-	os.WriteFile(filepath.Join(ir.evDir(), "dmesg-errors.txt"), got, 0o644)
-	ir.res.Evidence = append(ir.res.Evidence, "installed/dmesg-errors.txt")
+	if err := ir.writeRaw("dmesg-errors.txt", got); err != nil {
+		ir.fail("writing installed/dmesg-errors.txt: %v", err)
+	} else {
+		ir.addEvidence("dmesg-errors.txt")
+	}
 	d := installed.CompareDmesg(ir.r.j.ID, ir.r.j.Spec.Device,
 		installed.FileRef{File: ir.c.dmesgPath, SHA256: ir.c.dmesgSHA}, ir.c.dmesg,
 		installed.FileRef{File: filepath.Join(ir.evDir(), "dmesg-errors.txt"), SHA256: installed.SHA256(got)}, string(got))
@@ -386,44 +467,167 @@ func (ir *installedRun) dmesg(got []byte) *installed.DmesgCompare {
 	return d
 }
 
-// finish writes job.json and the frozen store's append-only copy.
-func (ir *installedRun) finish() {
-	j, err := ir.r.s.store.job(ir.r.j.ID)
-	if err != nil {
-		return
-	}
-	j.Result.Installed = &ir.res
-	ir.write("job.json", j)
-	dst := filepath.Join(ir.c.dir, "installed", ir.r.j.Spec.Device, ir.r.j.ID)
-	if _, err := os.Stat(dst); err == nil {
-		ir.r.ev("installed: %s already exists; the frozen copy is append-only, not overwritten", dst)
-		return
-	}
-	if err := os.MkdirAll(dst, 0o755); err != nil {
-		ir.r.ev("installed: frozen copy: %v", err)
-		return
-	}
-	ents, _ := os.ReadDir(ir.evDir())
-	for _, e := range ents {
-		if b, err := os.ReadFile(filepath.Join(ir.evDir(), e.Name())); err == nil {
-			os.WriteFile(filepath.Join(dst, e.Name()), b, 0o444)
+// installedEvidence is what a passing installed job must leave in installed/.
+var installedEvidence = []string{"identity-before.json", "identity-booted.json", "identity-after.json",
+	"omt-compare.json", "dmesg-compare.json", "dmesg-errors.txt"}
+
+// seal writes installed/job.json and the frozen store's append-only copy, and
+// returns the job's final outcome: a pass whose evidence is missing, couldn't
+// be written or couldn't be copied is not a pass. job.json is the record the
+// job will have once finishAt(outcome, summary, at) runs, and it is copied
+// last, so the frozen store never holds a pass record without its evidence.
+func (ir *installedRun) seal(outcome, summary string, at time.Time) (string, string) {
+	if outcome == api.OutcomePass {
+		for _, f := range installedEvidence {
+			if _, err := os.Stat(filepath.Join(ir.evDir(), f)); err != nil {
+				ir.fail("installed/%s is missing", f)
+			}
 		}
 	}
+	downgrade := func(why string) {
+		if outcome == api.OutcomePass {
+			outcome = api.OutcomeInfra
+		}
+		summary += "; installed evidence incomplete: " + why
+	}
+	if len(ir.errs) > 0 {
+		downgrade(strings.Join(ir.errs, "; "))
+	}
+	dst := filepath.Join(ir.c.dir, "installed", ir.r.j.Spec.Device, ir.r.j.ID)
+	record := func() error {
+		j, err := ir.r.s.store.job(ir.r.j.ID)
+		if err != nil {
+			return err
+		}
+		res := ir.res
+		j.State, j.Outcome, j.Summary = api.JobDone, outcome, summary
+		j.Events = append(j.Events, api.JobEvent{Time: at, Msg: "done: " + outcome + ": " + summary})
+		j.Result.Installed = &res
+		b, err := json.MarshalIndent(j, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := ir.writeRaw("job.json", append(b, '\n')); err != nil {
+			return err
+		}
+		ir.addEvidence("job.json")
+		return nil
+	}
 	ir.res.Frozen = dst
-	ir.r.s.updateJob(ir.r.j, func(j *api.Job) { j.Result.Installed = &ir.res })
+	err := record()
+	if err == nil {
+		err = ir.copyFrozen(dst)
+	}
+	if err != nil {
+		ir.res.Frozen = ""
+		ir.r.ev("installed: %v", err)
+		downgrade(err.Error())
+		// the job's own copy says what happened; the frozen store has no job.json
+		if err := record(); err != nil {
+			ir.r.ev("installed: rewriting installed/job.json: %v", err)
+		}
+	}
+	ir.r.s.updateJob(ir.r.j, func(j *api.Job) { res := ir.res; j.Result.Installed = &res })
+	return outcome, summary
+}
+
+// copyFrozen publishes installed/ as the frozen store's append-only copy.
+func (ir *installedRun) copyFrozen(dst string) error {
+	if err := publishDir(ir.evDir(), dst, "job.json"); err != nil {
+		return fmt.Errorf("frozen copy: %v", err)
+	}
+	return nil
 }
 
 // --- freezing and promotion (admin) ---
 
-// writeOnce writes a file that must not exist yet, read-only.
+// writeOnce writes a file that must not exist yet, read-only and synced. The
+// create is exclusive, so two writers can't both succeed.
 func writeOnce(path string, b []byte) error {
-	if _, err := os.Stat(path); err == nil {
-		return fmt.Errorf("%s already exists; frozen files are written once", path)
-	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0o444)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o444)
+	if errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("%s already exists; frozen files are written once", path)
+	} else if err != nil {
+		return err
+	}
+	if _, err = f.Write(b); err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(path)
+	}
+	return err
+}
+
+// publishDir copies the files of src into a new directory dst, read-only, each
+// read back, last file last, and makes dst appear only once it is complete: it
+// is built beside dst and renamed into place, refusing to replace anything.
+func publishDir(src, dst, last string) error {
+	if _, err := os.Lstat(dst); err == nil {
+		return fmt.Errorf("%s already exists; the frozen store is append-only", dst)
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.MkdirTemp(filepath.Dir(dst), "."+filepath.Base(dst)+".partial-")
+	if err != nil {
+		return err
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			os.RemoveAll(tmp)
+		}
+	}()
+	ents, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+	var names []string
+	for _, e := range ents {
+		if !e.Type().IsRegular() {
+			return fmt.Errorf("%s/%s is not a regular file", src, e.Name())
+		}
+		if e.Name() != last {
+			names = append(names, e.Name())
+		}
+	}
+	if last != "" {
+		if _, err := os.Stat(filepath.Join(src, last)); err != nil {
+			return err
+		}
+		names = append(names, last)
+	}
+	for _, name := range names {
+		b, err := os.ReadFile(filepath.Join(src, name))
+		if err != nil {
+			return err
+		}
+		if err := writeOnce(filepath.Join(tmp, name), b); err != nil {
+			return err
+		}
+		if back, err := os.ReadFile(filepath.Join(tmp, name)); err != nil || !bytes.Equal(back, b) {
+			return fmt.Errorf("%s did not read back identical (%v)", name, err)
+		}
+	}
+	if err := os.Chmod(tmp, 0o755); err != nil {
+		return err
+	}
+	if err := unix.Renameat2(unix.AT_FDCWD, tmp, unix.AT_FDCWD, dst, unix.RENAME_NOREPLACE); err != nil {
+		return fmt.Errorf("publishing %s: %w", dst, err)
+	}
+	ok = true
+	if d, err := os.Open(filepath.Dir(dst)); err == nil {
+		d.Sync()
+		d.Close()
+	}
+	return nil
 }
 
 type freezeManifestReq struct {
@@ -565,32 +769,198 @@ func (s *Server) hPromote(w http.ResponseWriter, r *http.Request) {
 	case ir == nil || ir.Release != release:
 		httpErr(w, 400, "job %s is not an installed job of release %s", j.ID, release)
 		return
-	case j.Outcome != api.OutcomePass || ir.Verdicts[installed.PhaseBooted] != "MATCH" || ir.Verdicts[installed.PhaseAfter] != "MATCH":
+	case j.State != api.JobDone || j.Outcome != api.OutcomePass || ir.Verdicts[installed.PhaseBefore] != "MATCH" ||
+		ir.Verdicts[installed.PhaseBooted] != "MATCH" || ir.Verdicts[installed.PhaseAfter] != "MATCH":
 		httpErr(w, 409, "job %s did not pass with matching identity (outcome %s, verdicts %v)", j.ID, j.Outcome, ir.Verdicts)
+		return
+	case ir.OMT != "NO_REGRESSION":
+		httpErr(w, 409, "job %s's omarchy-m-test comparison is %q, not NO_REGRESSION", j.ID, ir.OMT)
+		return
+	case ir.Dmesg != "NONE_NEW" && ir.Dmesg != "REVIEW_REQUIRED":
+		httpErr(w, 409, "job %s's kernel errors were not compared cleanly (%q)", j.ID, ir.Dmesg)
+		return
+	case ir.Frozen == "":
+		httpErr(w, 409, "job %s has no frozen evidence copy", j.ID)
+		return
+	}
+	// the frozen copy must still be the job's evidence, byte for byte
+	if err := sameFiles(filepath.Join(s.jobDir(j.ID), "installed"), ir.Frozen); err != nil {
+		httpErr(w, 409, "job %s's frozen copy: %v", j.ID, err)
+		return
+	}
+	report, err := os.ReadFile(filepath.Join(s.jobDir(j.ID), omtFile))
+	if err != nil {
+		httpErr(w, 409, "job %s has no omarchy-m-test report: %v", j.ID, err)
+		return
+	}
+	status, tool, kernel, err := installed.ReportStatus(report)
+	if err != nil {
+		httpErr(w, 409, "job %s's omarchy-m-test report: %v", j.ID, err)
+		return
+	}
+	dm, err := os.ReadFile(filepath.Join(ir.Frozen, "dmesg-errors.txt"))
+	if err != nil {
+		httpErr(w, 409, "job %s's frozen kernel errors: %v", j.ID, err)
+		return
+	}
+	ob, err := json.MarshalIndent(omtBaseline{Job: j.ID, Time: time.Now(), Kernel: kernel, Tool: tool, Status: status}, "", "  ")
+	if err != nil {
+		httpErr(w, 500, "%v", err)
+		return
+	}
+	ledger := filepath.Join(s.frozenDir(release), "promotions.log")
+	if b, err := os.ReadFile(ledger); err == nil && strings.Contains(string(b), "\t"+j.ID+"\t") {
+		httpErr(w, 409, "job %s is already in %s", j.ID, ledger)
+		return
+	} else if err != nil && !os.IsNotExist(err) {
+		httpErr(w, 500, "reading %s: %v", ledger, err)
 		return
 	}
 	v := s.dev(req.Device)
-	report, err := os.ReadFile(filepath.Join(s.jobDir(j.ID), omtFile))
-	if err != nil {
-		httpErr(w, 409, "job %s has no omarchy-m-test report", j.ID)
+	if v == nil {
+		httpErr(w, 404, "no device %s", req.Device)
 		return
 	}
-	status, tool, kernel, _ := installed.ReportStatus(report)
-	ob, _ := json.MarshalIndent(omtBaseline{Job: j.ID, Time: time.Now(), Kernel: kernel, Tool: tool, Status: status}, "", "  ")
-	dm, _ := os.ReadFile(filepath.Join(s.jobDir(j.ID), "installed", "dmesg-errors.txt"))
-	os.WriteFile(s.omtBaselinePath(req.Device), ob, 0o644)
-	os.WriteFile(s.baselinePath(req.Device), dm, 0o644)
-	v.mu.Lock()
-	v.d.KnownGood = j.Result.BootKernel
-	v.saveLocked()
-	v.mu.Unlock()
-	line := fmt.Sprintf("%s\t%s\t%s\t%s\taccepted-by=%s\n", time.Now().Format(time.RFC3339), req.Device, j.ID, j.Result.BootKernel, req.AcceptedBy)
-	f, err := os.OpenFile(filepath.Join(s.frozenDir(release), "promotions.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err == nil {
-		f.WriteString(line)
-		f.Close()
+	line, err := s.promote(v, release, j, req.AcceptedBy, ledger, map[string][]byte{s.omtBaselinePath(req.Device): ob, s.baselinePath(req.Device): dm})
+	if err != nil {
+		httpErr(w, 500, "%v", err)
+		return
 	}
 	writeJSON(w, map[string]any{"promoted": req.Device, "job": j.ID, "known_good": j.Result.BootKernel, "log": strings.TrimSpace(line)})
+}
+
+// promote replaces a Mac's references and known-good kernel with an accepted
+// installed job's, all or nothing: the new references are written beside the
+// live ones first, the decision goes into the ledger before anything changes,
+// the old references are kept as <file>.before-<job>, and any failure puts the
+// old ones back and says so in the ledger.
+func (s *Server) promote(v *dev, release string, j *api.Job, by, ledger string, refs map[string][]byte) (string, error) {
+	var paths []string
+	for p := range refs {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	staged := map[string]string{}
+	cleanup := func() {
+		for _, t := range staged {
+			os.Remove(t)
+		}
+	}
+	for _, p := range paths {
+		t := p + ".promote-" + j.ID
+		os.Remove(t)
+		if err := writeOnce(t, refs[p]); err != nil {
+			cleanup()
+			return "", fmt.Errorf("staging %s: %v; nothing was changed", p, err)
+		}
+		staged[p] = t
+	}
+	line := fmt.Sprintf("%s\t%s\t%s\t%s\taccepted-by=%s\n", time.Now().Format(time.RFC3339), j.Spec.Device, j.ID, j.Result.BootKernel, by)
+	if err := appendSynced(ledger, line); err != nil {
+		cleanup()
+		return "", fmt.Errorf("recording the promotion in %s: %v; nothing was changed", ledger, err)
+	}
+	failed := func(applied []string, why error) error {
+		var undo []string
+		for _, p := range applied {
+			if b, err := os.ReadFile(p + ".before-" + j.ID); err == nil {
+				if werr := writeFileAtomic(p, b); werr != nil {
+					undo = append(undo, p+": "+werr.Error())
+				}
+			} else if os.IsNotExist(err) {
+				os.Remove(p)
+			} else {
+				undo = append(undo, p+": "+err.Error())
+			}
+		}
+		cleanup()
+		note := fmt.Sprintf("%s\t%s\t%s\tFAILED\t%v\n", time.Now().Format(time.RFC3339), j.Spec.Device, j.ID, why)
+		lerr := appendSynced(ledger, note)
+		msg := fmt.Sprintf("promotion of %s failed: %v; the previous references were put back", j.ID, why)
+		if len(undo) > 0 {
+			msg = fmt.Sprintf("promotion of %s failed: %v; and putting back the previous references failed: %s (copies are in <file>.before-%s)", j.ID, why, strings.Join(undo, "; "), j.ID)
+		}
+		if lerr != nil {
+			msg += fmt.Sprintf("; the ledger could not record the failure: %v", lerr)
+		}
+		return errors.New(msg)
+	}
+	var applied []string
+	for _, p := range paths {
+		if old, err := os.ReadFile(p); err == nil {
+			if err := writeOnce(p+".before-"+j.ID, old); err != nil {
+				return "", failed(applied, fmt.Errorf("keeping the previous %s: %v", p, err))
+			}
+		} else if !os.IsNotExist(err) {
+			return "", failed(applied, err)
+		}
+		if err := os.Rename(staged[p], p); err != nil {
+			return "", failed(applied, err)
+		}
+		delete(staged, p)
+		applied = append(applied, p)
+	}
+	v.mu.Lock()
+	prev := v.d.KnownGood
+	v.d.KnownGood = j.Result.BootKernel
+	err := s.store.saveDevice(&v.d, v.secretHash)
+	if err != nil {
+		v.d.KnownGood = prev
+	}
+	v.mu.Unlock()
+	if err != nil {
+		return "", failed(applied, fmt.Errorf("saving the known-good kernel: %v", err))
+	}
+	return line, nil
+}
+
+// appendSynced appends a line to a file and syncs it.
+func appendSynced(path, line string) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err = f.WriteString(line); err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
+
+// sameFiles says whether two directories hold the same regular files, byte for byte.
+func sameFiles(a, b string) error {
+	list := func(d string) ([]string, error) {
+		ents, err := os.ReadDir(d)
+		if err != nil {
+			return nil, err
+		}
+		var n []string
+		for _, e := range ents {
+			n = append(n, e.Name())
+		}
+		return n, nil
+	}
+	na, err := list(a)
+	if err != nil {
+		return err
+	}
+	nb, err := list(b)
+	if err != nil {
+		return err
+	}
+	if !slices.Equal(na, nb) {
+		return fmt.Errorf("files differ: %v vs %v", na, nb)
+	}
+	for _, n := range na {
+		x, err1 := os.ReadFile(filepath.Join(a, n))
+		y, err2 := os.ReadFile(filepath.Join(b, n))
+		if err1 != nil || err2 != nil || !bytes.Equal(x, y) {
+			return fmt.Errorf("%s differs (%v %v)", n, err1, err2)
+		}
+	}
+	return nil
 }
 
 // hInstalledStatus lists a release's frozen files and their pins.

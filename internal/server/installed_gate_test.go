@@ -142,7 +142,7 @@ func TestInstalledGateEndToEnd(t *testing.T) {
 	lines := []string{"  //linux-aurora", "    protocol: efi", "    path: " + path, "    cmdline: " + strings.Join(tokens, " ")}
 	entry := installed.Entry{Found: true, Name: "Omarchy / linux-aurora", Protocol: "efi", Path: path,
 		Cmdline: strings.Join(tokens, " "), CmdlineTokens: tokens, EntryLines: lines, EntrySHA256: installed.EntryDigest(lines),
-		UKIFile: "/boot/efi/EFI/Linux/omarchy_linux-aurora.efi", UKISHA256: h("uki"),
+		UKIFile: "/boot/efi/EFI/Linux/omarchy_linux-aurora.efi", UKISHA256: h("uki"), UKIBlake2b: strings.Repeat("ab", 64),
 		UKISections: map[string]installed.Section{".linux": {SHA256: payload["vmlinuz"]}, ".initrd": {SHA256: h("initramfs")},
 			".cmdline": {SHA256: h("cmdline"), Text: strings.Join(tokens, " ")}, ".uname": {SHA256: h("uname"), Text: krel}}}
 	l.sim.PackagedKernels = []string{krel}

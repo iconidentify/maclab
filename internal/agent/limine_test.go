@@ -1,10 +1,14 @@
 package agent
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/iconidentify/maclab/internal/api"
 )
 
 // The head of Omarchy's Apple Silicon limine.conf, as limine-update writes it.
@@ -105,5 +109,33 @@ func TestUTF16z(t *testing.T) {
 	}
 	if got := fromUTF16z(b); got != "maclab-j1" {
 		t.Fatal(got)
+	}
+}
+
+// Staging an installed entry checks the UKI's SHA256 and that the path's #pin
+// is its BLAKE2b-512: on these Macs Limine only warns on a mismatch.
+func TestStageInstalledChecksBlake2bPin(t *testing.T) {
+	l := testLimine(t)
+	esp := filepath.Dir(l.Conf)
+	l.ESP = mount{Target: esp}
+	os.MkdirAll(filepath.Join(esp, "EFI/Linux"), 0o755)
+	os.WriteFile(filepath.Join(esp, "EFI/Linux/x.efi"), []byte("abc"), 0o644)
+	sum := sha256.Sum256([]byte("abc"))
+	// BLAKE2b-512("abc"), RFC 7693 appendix A
+	const abc = "ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d17d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923"
+	if got, _ := fileBlake2b(filepath.Join(esp, "EFI/Linux/x.efi")); got != abc {
+		t.Fatalf("fileBlake2b: %s", got)
+	}
+	bootPartitionLock = filepath.Join(t.TempDir(), "boot-partition.lock")
+	stage := func(pin string) error {
+		_, err := (&Linux{}).stageInstalled("j1", &api.InstalledStage{Path: "boot():/EFI/Linux/x.efi#" + pin, UKISHA256: hex.EncodeToString(sum[:]),
+			Cmdline: "root=UUID=x rw maclab.job=j1 panic=10", Release: "12.0"}, l, t.TempDir())
+		return err
+	}
+	if err := stage(strings.Repeat("0", 128)); err == nil || !strings.Contains(err.Error(), "pins") {
+		t.Fatalf("a wrong pin: %v", err)
+	}
+	if err := stage(abc); err != nil {
+		t.Fatalf("the right pin: %v", err)
 	}
 }

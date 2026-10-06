@@ -52,6 +52,8 @@ type Sim struct {
 	TestFiles   func(test, kernel string) map[string][]byte
 	DmesgErrors func(kernel string) string
 	OnExec      func(command string) (stdout string, ok bool) // answers lab exec instead of echoing
+	// CollectHook, when set, replaces log collection: it may write other files or fail.
+	CollectHook func(boot, outDir string) error
 	// PackagedKernels are releases installed as packages (installed-mode jobs).
 	PackagedKernels []string
 }
@@ -313,8 +315,11 @@ func (s *Sim) RunTest(ctx context.Context, job string, t api.TestSpec, fetch Fet
 }
 
 func (s *Sim) Collect(ctx context.Context, boot, outDir string) error {
+	if s.CollectHook != nil {
+		return s.CollectHook(boot, outDir)
+	}
 	s.mu.Lock()
-	k := s.kernel
+	k, cmdline := s.kernel, s.cmdline
 	s.mu.Unlock()
 	errs := "apple-dart 382f00000.dart: DART fault\n"
 	if k != SimKnownGood {
@@ -325,7 +330,8 @@ func (s *Sim) Collect(ctx context.Context, boot, outDir string) error {
 	}
 	os.WriteFile(filepath.Join(outDir, "dmesg-errors.txt"), []byte(errs), 0o644)
 	os.WriteFile(filepath.Join(outDir, "journal.txt"), []byte("sim journal for boot "+boot+"\n"), 0o644)
-	return nil
+	os.WriteFile(filepath.Join(outDir, "kernel.txt"), []byte("[    0.000000] Linux version "+k+"\n[    0.000000] Kernel command line: "+cmdline+"\n"), 0o644)
+	return os.WriteFile(filepath.Join(outDir, "collect-status.txt"), []byte("journal.txt ok\nkernel.txt ok\ndmesg-errors.txt ok\n"), 0o644)
 }
 
 func (s *Sim) Screenshot(ctx context.Context, path string, wait time.Duration) (int, int, error) {

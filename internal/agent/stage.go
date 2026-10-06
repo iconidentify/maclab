@@ -15,6 +15,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/crypto/blake2b"
+
 	"github.com/iconidentify/maclab/internal/api"
 )
 
@@ -146,6 +148,15 @@ func (l *Linux) stageInstalled(job string, in *api.InstalledStage, lim *limineLa
 	if sum != in.UKISHA256 {
 		return res, fmt.Errorf("installer UKI %s is %s, not the frozen %s", f, sum, in.UKISHA256)
 	}
+	// Limine checks the path's #pin itself, but on these Macs a mismatch only
+	// warns (hash_mismatch_panic: no): check it here, before arming anything.
+	b2, err := fileBlake2b(f)
+	if err != nil {
+		return res, fmt.Errorf("installer UKI %s: %w", f, err)
+	}
+	if _, pin, _ := strings.Cut(in.Path, "#"); pin != b2 {
+		return res, fmt.Errorf("installer UKI %s measures BLAKE2b %s, but its path pins %q", f, b2, pin)
+	}
 	title := fmt.Sprintf("maclab %s: installed %s", job, in.Release)
 	entry := fmt.Sprintf("/%s%s\n    comment: %s\n    protocol: efi\n    path: %s\n    cmdline: %s\n",
 		entryPrefix, job, strings.NewReplacer("\n", " ", "#", "").Replace(title), in.Path, in.Cmdline)
@@ -160,6 +171,19 @@ func (l *Linux) stageInstalled(job string, in *api.InstalledStage, lim *limineLa
 		return res, err
 	}
 	return api.StageResult{KernelRelease: in.Release, Entry: entryPrefix + job, Cmdline: in.Cmdline}, nil
+}
+
+func fileBlake2b(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h, _ := blake2b.New512(nil)
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // limineFile maps a Limine path such as boot():/EFI/Linux/x.efi#<hash> to its file on the ESP.

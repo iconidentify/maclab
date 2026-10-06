@@ -173,17 +173,20 @@ func (s *Server) runJob(ctx context.Context, v *dev, j *api.Job) {
 	if r.omtRef != nil {
 		r.promoteOMT(outcome)
 	}
-	r.finish(outcome, summary)
+	at := time.Now()
 	if r.ir != nil {
-		// after finish, so the evidence copy carries the outcome and summary
-		r.ir.finish()
+		// the evidence copy carries the final record, and can still fail the job
+		outcome, summary = r.ir.seal(outcome, summary, at)
 	}
+	r.finishAt(outcome, summary, at)
 }
 
-func (r *jobRun) finish(outcome, summary string) {
+func (r *jobRun) finish(outcome, summary string) { r.finishAt(outcome, summary, time.Now()) }
+
+func (r *jobRun) finishAt(outcome, summary string, at time.Time) {
 	r.s.updateJob(r.j, func(j *api.Job) {
 		j.State, j.Outcome, j.Summary = api.JobDone, outcome, summary
-		j.Events = append(j.Events, api.JobEvent{Time: time.Now(), Msg: "done: " + outcome + ": " + summary})
+		j.Events = append(j.Events, api.JobEvent{Time: at, Msg: "done: " + outcome + ": " + summary})
 	})
 	r.s.log.Printf("job %s done: %s: %s", r.j.ID, outcome, summary)
 	if outcome != api.OutcomePass && outcome != api.OutcomeCanceled {
@@ -332,7 +335,7 @@ func (r *jobRun) execute(ctx context.Context) (string, string) {
 
 	r.capture("after-tests")
 	r.state(api.JobCollecting)
-	files := r.collect(ctx, "0")
+	files, collectErr := r.collectE(ctx, "0")
 	if b, err := os.ReadFile(filepath.Join(r.s.jobDir(j.ID), "boot0", "systemd-analyze.txt")); err == nil {
 		if first, _, _ := strings.Cut(strings.TrimSpace(string(b)), "\n"); first != "" {
 			r.ev("systemd-analyze: %s", first)
@@ -340,17 +343,25 @@ func (r *jobRun) execute(ctx context.Context) (string, string) {
 	}
 	var newLines []string
 	var dmesgFatal []string
+	var logsErr error
+	if r.ir != nil {
+		// an installed job is judged on its kernel log: without it, it can't pass
+		if got, err := kernelLogs(r.s.jobDir(j.ID), files, collectErr); err != nil {
+			logsErr = err
+			r.ir.fail("kernel log: %v", err)
+		} else {
+			dc := r.ir.dmesg(got)
+			newLines = dc.NewLines
+			for _, h := range dc.FatalHits {
+				dmesgFatal = append(dmesgFatal, h.Kind+": "+h.Line)
+			}
+		}
+		r.s.updateJob(j, func(j *api.Job) { j.Result.Installed = &r.ir.res })
+	}
 	for _, f := range files {
-		if strings.HasSuffix(f, "/dmesg-errors.txt") {
+		if strings.HasSuffix(f, "/dmesg-errors.txt") && r.ir == nil {
 			got, _ := os.ReadFile(filepath.Join(r.s.jobDir(j.ID), f))
-			if r.ir != nil {
-				dc := r.ir.dmesg(got)
-				newLines = dc.NewLines
-				for _, h := range dc.FatalHits {
-					dmesgFatal = append(dmesgFatal, h.Kind+": "+h.Line)
-				}
-				r.s.updateJob(j, func(j *api.Job) { j.Result.Installed = &r.ir.res })
-			} else if j.Spec.Baseline {
+			if j.Spec.Baseline {
 				os.WriteFile(r.s.baselinePath(d.Name), got, 0o644)
 			} else if base, err := os.ReadFile(r.s.baselinePath(d.Name)); err == nil {
 				newLines = detect.NewLines(string(base), string(got))
@@ -371,6 +382,8 @@ func (r *jobRun) execute(ctx context.Context) (string, string) {
 	health := v.snapshot().Health
 
 	switch {
+	case logsErr != nil:
+		return api.OutcomeInfra, fmt.Sprintf("booted %s, but its kernel log is missing, so the installed run can't be judged: %v", d.Kernel, logsErr)
 	case failed > 0:
 		return api.OutcomeTestsFailed, fmt.Sprintf("booted %s; %d of %d tests failed", d.Kernel, failed, nTests)
 	case len(dmesgFatal) > 0:
@@ -512,13 +525,18 @@ func (r *jobRun) crashTest(ctx context.Context) (string, string) {
 }
 
 func (r *jobRun) collect(ctx context.Context, boot string) []string {
+	files, _ := r.collectE(ctx, boot)
+	return files
+}
+
+func (r *jobRun) collectE(ctx context.Context, boot string) ([]string, error) {
 	var files []string
 	if err := r.v.call(ctx, api.CmdCollect, r.j.ID, api.CollectArgs{Boot: boot}, 5*time.Minute, &files); err != nil {
 		r.ev("collect logs (boot %s): %v", boot, err)
-		return nil
+		return nil, err
 	}
 	r.s.updateJob(r.j, func(j *api.Job) { j.Result.Logs = append(j.Result.Logs, files...) })
-	return files
+	return files, nil
 }
 
 // restore gets the Mac back onto its known-good kernel and removes the staged one.

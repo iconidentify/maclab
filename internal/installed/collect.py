@@ -23,6 +23,18 @@ def sha(path):
     return h.hexdigest()
 
 
+def blake2b(path):
+    """BLAKE2b-512, the hash a Limine path's #pin names."""
+    h = hashlib.blake2b()
+    try:
+        with open(path, "rb") as f:
+            for b in iter(lambda: f.read(1 << 20), b""):
+                h.update(b)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
 def rd(p):
     try:
         return open(p, "rb").read().replace(b"\0", b"").decode(errors="replace").strip()
@@ -143,7 +155,8 @@ def installer_entry(krel, entry_path):
                 "cmdline": kv.get("cmdline", ""), "cmdline_tokens": kv.get("cmdline", "").split(),
                 "entry_lines": e["lines"],
                 "entry_sha256": hashlib.sha256(("\n".join(e["lines"]) + "\n").encode()).hexdigest(),
-                "uki_file": f, "uki_sha256": sha(f), "uki_sections": secs, "limine_conf_sha256": conf_sha}
+                "uki_file": f, "uki_sha256": sha(f), "uki_blake2b": blake2b(f), "uki_sections": secs,
+                "limine_conf_sha256": conf_sha}
         if entry_path:
             if path == entry_path:
                 return cand
