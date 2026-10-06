@@ -197,7 +197,9 @@ func (l *limineLayout) arm(entry string) error {
 	}
 	job := strings.TrimPrefix(entry, entryPrefix)
 	if _, err := os.Stat(filepath.Join(l.Stage, job, "uki.efi")); err != nil {
-		return fmt.Errorf("entry %s is not staged", entry)
+		if _, err := os.Stat(filepath.Join(l.Stage, job, installedMarker)); err != nil {
+			return fmt.Errorf("entry %s is not staged", entry)
+		}
 	}
 	unlock, err := lockBootPartition(time.Minute)
 	if err != nil {

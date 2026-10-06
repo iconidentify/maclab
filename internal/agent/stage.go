@@ -2,8 +2,11 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path"
@@ -43,7 +46,13 @@ func (l *Linux) Stage(ctx context.Context, job string, a api.StageArgs, fetch Fe
 		return res, err
 	}
 	if lim, ok := b.(*limineLayout); ok {
+		if a.Installed != nil {
+			return l.stageInstalled(job, a.Installed, lim, bootDir)
+		}
 		return l.stageLimine(ctx, job, a, kg, lim, bootDir, fetch)
+	}
+	if a.Installed != nil {
+		return res, errors.New("installed-kernel jobs need Limine (they boot the installer's UKI entry)")
 	}
 	g := b.(*grubLayout)
 
@@ -116,6 +125,63 @@ func (l *Linux) stageLimine(ctx context.Context, job string, a api.StageArgs, kg
 		return res, err
 	}
 	return api.StageResult{KernelRelease: krel, Entry: entryPrefix + job, Cmdline: cmdline}, nil
+}
+
+// installedMarker in a job's stage dir says its entry boots an installed UKI.
+const installedMarker = "installed"
+
+// stageInstalled lists a one-shot lab entry that boots the installer's own UKI
+// (the same file, same path and #hash pin) with the cmdline labd built from the
+// installer's: nothing is copied, rebuilt or regenerated.
+func (l *Linux) stageInstalled(job string, in *api.InstalledStage, lim *limineLayout, bootDir string) (api.StageResult, error) {
+	var res api.StageResult
+	if in.Path == "" || in.UKISHA256 == "" || in.Cmdline == "" || strings.ContainsAny(in.Path+in.Cmdline, "\n\r") {
+		return res, errors.New("installed stage needs a one-line path, uki_sha256 and cmdline")
+	}
+	f := limineFile(lim.ESP.Target, in.Path)
+	sum, err := fileSHA256(f)
+	if err != nil {
+		return res, fmt.Errorf("installer UKI %s: %w", f, err)
+	}
+	if sum != in.UKISHA256 {
+		return res, fmt.Errorf("installer UKI %s is %s, not the frozen %s", f, sum, in.UKISHA256)
+	}
+	title := fmt.Sprintf("maclab %s: installed %s", job, in.Release)
+	entry := fmt.Sprintf("/%s%s\n    comment: %s\n    protocol: efi\n    path: %s\n    cmdline: %s\n",
+		entryPrefix, job, strings.NewReplacer("\n", " ", "#", "").Replace(title), in.Path, in.Cmdline)
+	os.WriteFile(filepath.Join(bootDir, "krel"), []byte(in.Release), 0o644)
+	if err := os.WriteFile(filepath.Join(bootDir, installedMarker), []byte(in.Path+"\n"), 0o644); err != nil {
+		return res, err
+	}
+	if err := os.WriteFile(filepath.Join(bootDir, limineEntry), []byte(entry), 0o644); err != nil {
+		return res, err
+	}
+	if err := lim.writeEntries(); err != nil {
+		return res, err
+	}
+	return api.StageResult{KernelRelease: in.Release, Entry: entryPrefix + job, Cmdline: in.Cmdline}, nil
+}
+
+// limineFile maps a Limine path such as boot():/EFI/Linux/x.efi#<hash> to its file on the ESP.
+func limineFile(esp, p string) string {
+	p, _, _ = strings.Cut(p, "#")
+	if i := strings.Index(p, "):"); i >= 0 && strings.Contains(p[:i], "(") {
+		p = p[i+2:]
+	}
+	return filepath.Join(esp, strings.TrimLeft(p, "/"))
+}
+
+func fileSHA256(p string) (string, error) {
+	f, err := os.Open(p)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // stageCmdline is the cmdline a test boot gets. It starts from a base: the

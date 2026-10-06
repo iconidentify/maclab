@@ -5,6 +5,10 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -39,6 +43,10 @@ const usage = `lab: run kernels and tests on Omarchy Macs
   lab jobs [device] | lab job <id> | lab wait <id> | lab cancel <id> | lab logs <id> [file]
   lab publish <job>                   upload a known-good run's omarchy-m-test report to omarchy-m-testing.org
   lab lease <device> [--ttl 1h] | lab release <device>
+  lab installed freeze-manifest --release R <manifest.json> <payload.sha256> [--approved-by a,b]
+  lab installed freeze-entry <device> --release R    freeze the installer's boot entry, after the install
+  lab installed promote <device> --release R --job <id> --accepted-by <who>
+  lab installed status --release R                   the frozen files of a release
   lab reset <device>                  run the recovery ladder on an idle Mac by hand
   lab shell <device>                  shell over the serial link: works with the Mac's network down (Ctrl-] exits)
   lab serial <device> [-n 100] | lab oob <device>
@@ -196,6 +204,7 @@ func dispatch(ctx context.Context, c *client.Client, cmd string, args []string) 
 		scriptTimeout := fs.Duration("script-timeout", 0, "time each --script/--gui-script test may run, e.g. 90m for a hands-on session (default 5m, at most 4h)")
 		omtAllow := fs.String("omt-allow", "", "omarchy-m-test checks this kernel is expected to fail, comma-separated (hardware.drivers:<compatible> for one unbound node)")
 		publish := fs.Bool("publish", false, "publish the omarchy-m-test report to omarchy-m-testing.org (known-good kernel runs only)")
+		installedMan := fs.String("installed", "", "boot the INSTALLED release through its installer entry and check it against a frozen expected manifest (file or sha256); see `lab installed`")
 		var tests, guiTests, scripts, guiScripts multi
 		fs.Var(&tests, "test", "builtin test to run (repeatable)")
 		fs.Var(&guiTests, "gui-test", "builtin GUI test to run in the Wayland session (repeatable)")
@@ -210,6 +219,13 @@ func dispatch(ctx context.Context, c *client.Client, cmd string, args []string) 
 		spec.CmdlineBase = *cmdlineBase
 		spec.CmdlineStrip = strings.FieldsFunc(*cmdlineStrip, func(r rune) bool { return r == ',' || r == ' ' })
 		spec.VerboseBoot = *verboseBoot
+		if *installedMan != "" {
+			sha, err := manifestSHA(*installedMan)
+			if err != nil {
+				return err
+			}
+			spec.InstalledManifest = sha
+		}
 		if *scriptTimeout > 4*time.Hour {
 			return fmt.Errorf("--script-timeout %s: at most 4h", *scriptTimeout)
 		}
@@ -320,6 +336,9 @@ func dispatch(ctx context.Context, c *client.Client, cmd string, args []string) 
 			return err
 		}
 		return getBuildFiles(ctx, c, b, *out)
+
+	case "installed":
+		return installedCmd(ctx, c, args)
 
 	case "builds":
 		l, err := c.Builds(ctx, 20)
@@ -1025,4 +1044,72 @@ func recipeFiles(dir string) ([]string, error) {
 		names = append(names, loc)
 	}
 	return names, nil
+}
+
+// manifestSHA accepts a manifest file or its sha256.
+func manifestSHA(arg string) (string, error) {
+	if b, err := os.ReadFile(arg); err == nil {
+		sum := sha256.Sum256(b)
+		return hex.EncodeToString(sum[:]), nil
+	}
+	if len(arg) == 64 && strings.Trim(arg, "0123456789abcdef") == "" {
+		return arg, nil
+	}
+	return "", fmt.Errorf("--installed takes the frozen manifest file or its full sha256, not %q", arg)
+}
+
+// installedCmd handles `lab installed ...`: freezing a release's expectation
+// and promoting an accepted installed run.
+func installedCmd(ctx context.Context, c *client.Client, args []string) error {
+	if len(args) < 1 {
+		return errors.New("lab installed freeze-manifest|freeze-entry|promote|status ...")
+	}
+	sub := args[0]
+	fs := flag.NewFlagSet("installed "+sub, flag.ContinueOnError)
+	release := fs.String("release", "", "release name, e.g. 12.0")
+	approved := fs.String("approved-by", "", "who approved the manifest, comma-separated")
+	job := fs.String("job", "", "the installed job to promote")
+	accepted := fs.String("accepted-by", "", "who accepted it (required)")
+	pos := parse(fs, args[1:])
+	if *release == "" {
+		return errors.New("--release is required")
+	}
+	var out map[string]any
+	var err error
+	switch sub {
+	case "freeze-manifest":
+		if err := need(pos, 2, "lab installed freeze-manifest --release R <manifest.json> <payload.sha256>"); err != nil {
+			return err
+		}
+		m, err1 := c.Upload(ctx, pos[0])
+		p, err2 := c.Upload(ctx, pos[1])
+		if err1 != nil || err2 != nil {
+			return errors.Join(err1, err2)
+		}
+		var by []string
+		if *approved != "" {
+			by = strings.Split(*approved, ",")
+		}
+		err = c.Installed(ctx, "POST", *release, "manifest", map[string]any{"manifest": m, "payload": p, "approved_by": by}, &out)
+	case "freeze-entry":
+		if err := need(pos, 1, "lab installed freeze-entry <device> --release R"); err != nil {
+			return err
+		}
+		err = c.Installed(ctx, "POST", *release, "entry/"+pos[0], nil, &out)
+	case "promote":
+		if err := need(pos, 1, "lab installed promote <device> --release R --job <id> --accepted-by <who>"); err != nil {
+			return err
+		}
+		err = c.Installed(ctx, "POST", *release, "promote", map[string]any{"device": pos[0], "job": *job, "accepted_by": *accepted}, &out)
+	case "status":
+		err = c.Installed(ctx, "GET", *release, "", nil, &out)
+	default:
+		return fmt.Errorf("unknown: lab installed %s", sub)
+	}
+	if err != nil {
+		return err
+	}
+	b, _ := json.MarshalIndent(out, "", "  ")
+	fmt.Println(string(b))
+	return nil
 }

@@ -10,6 +10,7 @@ import (
 	"image/jpeg"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -31,21 +32,34 @@ type Sim struct {
 	WorkDir     string
 	SuspendFor  time.Duration
 
-	mu       sync.Mutex
-	sleepFn  func(bool)
-	bootID   string
-	kernel   string
-	cmdline  string
-	alive    bool
-	armed    string
-	staged   map[string]simEntry
-	behavior string
-	gen      int
-	kmsg     chan string
-	Boots    int
+	mu           sync.Mutex
+	sleepFn      func(bool)
+	bootID       string
+	kernel       string
+	cmdline      string
+	alive        bool
+	armed        string
+	staged       map[string]simEntry
+	behavior     string
+	gen          int
+	kmsg         chan string
+	Boots        int
+	InstalledObs func(phase, job, bootID, kernel, cmdline string) []byte
+	// Tests may stand in fixture files: OMTReport replaces the synthetic
+	// omarchy-m-test report, TestFiles adds files a test leaves in its output
+	// directory, and DmesgErrors replaces the collected kernel error lines.
+	OMTReport   func(kernel string) []byte
+	TestFiles   func(test, kernel string) map[string][]byte
+	DmesgErrors func(kernel string) string
+	OnExec      func(command string) (stdout string, ok bool) // answers lab exec instead of echoing
+	// PackagedKernels are releases installed as packages (installed-mode jobs).
+	PackagedKernels []string
 }
 
 type simEntry struct{ krel, behavior, cmdline string }
+
+// InstalledObs, when set, answers installed-mode identity tests: it returns
+// the collector's observation for a phase on the given running boot.
 
 const SimKnownGood = "7.1.12-good"
 
@@ -59,10 +73,12 @@ func NewSim(workDir string) *Sim {
 	return s
 }
 
+// newID is a boot ID shaped like /proc/sys/kernel/random/boot_id.
 func newID() string {
-	b := make([]byte, 8)
+	b := make([]byte, 16)
 	rand.Read(b)
-	return hex.EncodeToString(b)
+	h := hex.EncodeToString(b)
+	return h[:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:]
 }
 
 func (s *Sim) say(line string) {
@@ -109,6 +125,15 @@ func (s *Sim) WatchKernel(ctx context.Context, fn func(string)) {
 }
 
 func (s *Sim) Stage(ctx context.Context, job string, a api.StageArgs, fetch Fetcher) (api.StageResult, error) {
+	if in := a.Installed; in != nil {
+		if in.Path == "" || in.UKISHA256 == "" || in.Cmdline == "" {
+			return api.StageResult{}, fmt.Errorf("installed stage needs path, uki_sha256 and cmdline")
+		}
+		s.mu.Lock()
+		s.staged[job] = simEntry{krel: in.Release, behavior: "ok", cmdline: in.Cmdline}
+		s.mu.Unlock()
+		return api.StageResult{KernelRelease: in.Release, Entry: entryPrefix + job, Cmdline: in.Cmdline}, nil
+	}
 	e := simEntry{krel: SimKnownGood, behavior: "ok"}
 	if a.Artifact != "" {
 		p := filepath.Join(s.WorkDir, job+".art")
@@ -250,6 +275,14 @@ func (s *Sim) RunTest(ctx context.Context, job string, t api.TestSpec, fetch Fet
 	if t.Builtin == "omarchy-m-test" {
 		return s.omtReport(t, outDir, b)
 	}
+	if strings.HasPrefix(t.Name, "identity-") && s.InstalledObs != nil {
+		s.mu.Lock()
+		boot, k, cmd := s.bootID, s.kernel, s.cmdline
+		s.mu.Unlock()
+		obs := s.InstalledObs(strings.TrimPrefix(t.Name, "identity-"), job, boot, k, cmd)
+		os.WriteFile(filepath.Join(outDir, "observed.json"), obs, 0o644)
+		return api.TestResult{Name: t.Name, Passed: true, Seconds: 0.01, Tail: "sim identity " + t.Name}
+	}
 	if strings.HasPrefix(t.Name, "suspend-") || strings.HasPrefix(t.Name, "quiet-suspend-") {
 		s.suspend(s.SuspendFor, strings.HasPrefix(t.Name, "suspend-"))
 	}
@@ -261,6 +294,16 @@ func (s *Sim) RunTest(ctx context.Context, job string, t api.TestSpec, fetch Fet
 		return api.TestResult{Name: t.Name, Error: "machine went away"}
 	}
 	os.WriteFile(filepath.Join(outDir, "log.txt"), []byte("sim test "+t.Name+" ok\n"), 0o644)
+	if s.TestFiles != nil {
+		s.mu.Lock()
+		k := s.kernel
+		s.mu.Unlock()
+		for name, data := range s.TestFiles(t.Name, k) {
+			p := filepath.Join(outDir, filepath.FromSlash(name))
+			os.MkdirAll(filepath.Dir(p), 0o755)
+			os.WriteFile(p, data, 0o644)
+		}
+	}
 	passed := !strings.Contains(t.Name, "fail")
 	code := 0
 	if !passed {
@@ -276,6 +319,9 @@ func (s *Sim) Collect(ctx context.Context, boot, outDir string) error {
 	errs := "apple-dart 382f00000.dart: DART fault\n"
 	if k != SimKnownGood {
 		errs += "sim: new regression warning in driver foo\n"
+	}
+	if s.DmesgErrors != nil {
+		errs = s.DmesgErrors(k)
 	}
 	os.WriteFile(filepath.Join(outDir, "dmesg-errors.txt"), []byte(errs), 0o644)
 	os.WriteFile(filepath.Join(outDir, "journal.txt"), []byte("sim journal for boot "+boot+"\n"), 0o644)
@@ -339,6 +385,11 @@ func (s *Sim) KernelConfig() (string, error) {
 }
 
 func (s *Sim) Exec(ctx context.Context, a api.ExecArgs) api.ExecResult {
+	if s.OnExec != nil {
+		if out, ok := s.OnExec(a.Command); ok {
+			return api.ExecResult{Stdout: out, Via: "agent"}
+		}
+	}
 	return api.ExecResult{Stdout: "sim ran: " + a.Command + "\n", Via: "agent"}
 }
 
@@ -348,7 +399,7 @@ func (s *Sim) omtReport(t api.TestSpec, outDir, behavior string) api.TestResult 
 	kernel := s.kernel
 	s.mu.Unlock()
 	wifi, pkg := "pass", "pass"
-	if kernel != SimKnownGood {
+	if kernel != SimKnownGood && !slices.Contains(s.PackagedKernels, kernel) {
 		pkg = "fail" // a lab kernel is never an installed package
 	}
 	unclaimed, drivers := "[]", "pass"
@@ -365,6 +416,9 @@ func (s *Sim) omtReport(t api.TestSpec, outDir, behavior string) api.TestResult 
 {"id":"wifi.connected","kind":"automatic","status":%q,"evidence":["wlan0 up"],"classification":{"outcome":"works"}},
 {"id":"system.snapshots","kind":"automatic","status":"fail","evidence":["/.snapshots is not a btrfs subvolume"],"classification":{"outcome":"fails"}},
 {"id":"display.cursor","kind":"human","status":"skip","evidence":["no answer"]}],"signature":{"public_key":"ssh-ed25519 AAAA","signature":"sim"}}`, unclaimed, kernel, pkg, drivers, wifi)
+	if s.OMTReport != nil {
+		report = string(s.OMTReport(kernel))
+	}
 	os.WriteFile(filepath.Join(outDir, "omt-report.json"), []byte(report), 0o644)
 	return api.TestResult{Name: t.Name, Passed: true, Seconds: 0.01, Tail: "omarchy-m-test 0.1.10 on " + kernel}
 }

@@ -311,6 +311,24 @@ func (c *Client) BuildFile(ctx context.Context, id, name, dst string) (string, e
 	return hex.EncodeToString(h.Sum(nil)), os.Rename(dst+".part", dst)
 }
 
+// Installed sends one of the installed-release admin requests
+// (/api/installed/<release>[/<what>]) and decodes the reply into out.
+func (c *Client) Installed(ctx context.Context, method, release, what string, body, out any) error {
+	var r io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		r = bytes.NewReader(b)
+	}
+	p := "/api/installed/" + url.PathEscape(release)
+	if what != "" {
+		p += "/" + what
+	}
+	return c.do(ctx, method, p, r, out)
+}
+
 func (c *Client) CancelBuild(ctx context.Context, id string) error {
 	return c.do(ctx, "POST", "/api/builds/"+url.PathEscape(id)+"/cancel", nil, nil)
 }

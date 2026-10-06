@@ -135,6 +135,15 @@ func (r *jobRun) omtResult(tr *api.TestResult) {
 			res.Skip++
 		}
 	}
+	if r.ir != nil {
+		// an installed run is judged against the frozen pre-install report and
+		// never becomes a reference
+		res.KnownGood = false
+		r.ir.omt(tr, res, data)
+		r.s.updateJob(j, func(j *api.Job) { j.Result.OMT = res })
+		r.ev("omarchy-m-test %s: %d pass, %d fail, %d skipped; %s vs %s", res.Tool, res.Pass, res.Fail, res.Skip, r.ir.res.OMT, res.ComparedTo)
+		return
+	}
 	base := r.s.omtBaseline(j.Spec.Device)
 	switch {
 	case res.KnownGood:
@@ -167,9 +176,26 @@ func (r *jobRun) omtResult(tr *api.TestResult) {
 		res.Tool, res.Pass, res.Fail, res.Skip, len(res.Regressions), len(res.Fixed), res.ComparedTo)
 	if res.KnownGood {
 		// A known-good kernel can't regress against itself in a way that blames
-		// the kernel; it just becomes the reference.
-		b, _ := json.MarshalIndent(omtBaseline{Job: j.ID, Time: time.Now(), Kernel: res.Kernel, Tool: res.Tool, Status: status}, "", "  ")
-		os.WriteFile(r.s.omtBaselinePath(j.Spec.Device), b, 0o644)
+		// the kernel, so the test isn't failed. But a pass that turned into a
+		// fail says something else changed (boot.bin, firmware, a cable), and a
+		// run like that must not become the reference later runs are judged by.
+		kg := r.v.snapshot().KnownGood
+		switch {
+		case j.Spec.Baseline:
+			// lab baseline is how a person sets the references on purpose
+			r.omtRef, _ = json.MarshalIndent(omtBaseline{Job: j.ID, Time: time.Now(), Kernel: res.Kernel, Tool: res.Tool, Status: status}, "", "  ")
+			res.Reference = "a baseline: becomes the reference if it passes"
+		case len(res.Regressions) > 0:
+			res.Reference = fmt.Sprintf("kept %s: %d checks passed there and fail here", base.Job, len(res.Regressions))
+		case kg == "" || res.Kernel != kg:
+			res.Reference = fmt.Sprintf("not a reference: ran on %s, the known-good kernel is %q", res.Kernel, kg)
+		case j.Spec.Cmdline != "" || len(j.Spec.CmdlineStrip) > 0 || (j.Spec.CmdlineBase != "" && j.Spec.CmdlineBase != "known-good"):
+			res.Reference = "not a reference: the job changed the known-good cmdline"
+		default:
+			r.omtRef, _ = json.MarshalIndent(omtBaseline{Job: j.ID, Time: time.Now(), Kernel: res.Kernel, Tool: res.Tool, Status: status}, "", "  ")
+			res.Reference = "becomes the reference if the job passes"
+		}
+		r.s.updateJob(j, func(j *api.Job) { j.Result.OMT = res })
 		return
 	}
 	if len(res.Regressions) > 0 {
@@ -361,4 +387,38 @@ func versionAtLeast(have, want string) bool {
 		}
 	}
 	return true
+}
+
+// promoteOMT makes a known-good run the reference once the whole job passed:
+// a failed test, an unhealthy boot or a failed restore keeps the old one.
+func (r *jobRun) promoteOMT(outcome string) {
+	j := r.j
+	if outcome != api.OutcomePass {
+		r.ev("omarchy-m-test reference kept: the job ended %s", outcome)
+		r.s.updateJob(j, func(j *api.Job) {
+			if j.Result.OMT != nil {
+				j.Result.OMT.Reference = "kept the previous reference: the job ended " + outcome
+			}
+		})
+		return
+	}
+	if err := writeFileAtomic(r.s.omtBaselinePath(j.Spec.Device), r.omtRef); err != nil {
+		r.ev("omarchy-m-test reference: %v", err)
+		return
+	}
+	r.ev("omarchy-m-test reference is now this run")
+	r.s.updateJob(j, func(j *api.Job) {
+		if j.Result.OMT != nil {
+			j.Result.OMT.Reference = "became the reference"
+		}
+	})
+}
+
+// writeFileAtomic replaces path with data, never leaving a partial file.
+func writeFileAtomic(path string, data []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }

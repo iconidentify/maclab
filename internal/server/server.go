@@ -370,6 +370,10 @@ func (s *Server) Handler() http.Handler {
 	m.HandleFunc("POST /api/builder/artifacts", s.builderAuth(s.hBuilderArtifact))
 	m.HandleFunc("GET /api/builder/artifacts/{sha}", s.builderAuth(s.hAgentArtifact))
 	m.HandleFunc("POST /api/builds", s.admin(s.hCreateBuild))
+	m.HandleFunc("POST /api/installed/{release}/manifest", s.admin(s.hFreezeManifest))
+	m.HandleFunc("POST /api/installed/{release}/entry/{device}", s.admin(s.hFreezeEntry))
+	m.HandleFunc("POST /api/installed/{release}/promote", s.admin(s.hPromote))
+	m.HandleFunc("GET /api/installed/{release}", s.admin(s.hInstalledStatus))
 	m.HandleFunc("GET /api/builds", s.admin(s.hBuilds))
 	m.HandleFunc("GET /api/builds/{id}", s.admin(s.hBuild))
 	m.HandleFunc("GET /api/builds/{id}/log", s.admin(s.hBuildLog))
@@ -903,7 +907,14 @@ func (s *Server) Submit(spec api.JobSpec) (*api.Job, int, error) {
 	if d.KnownGood == "" && !spec.Baseline {
 		return nil, 409, fmt.Errorf("%s has not passed a baseline yet: run `lab baseline %s` first", d.Name, d.Name)
 	}
-	if !d.Facts.PreflightOK {
+	if spec.InstalledManifest != "" {
+		if code, err := s.validateInstalled(spec, d.Device); err != nil {
+			return nil, code, err
+		}
+		if p := installedPreflight(d.Facts.Problems); !d.Facts.PreflightOK && len(p) > 0 {
+			return nil, 409, fmt.Errorf("%s fails preflight: %s", d.Name, strings.Join(p, "; "))
+		}
+	} else if !d.Facts.PreflightOK {
 		return nil, 409, fmt.Errorf("%s fails preflight: %s", d.Name, strings.Join(d.Facts.Problems, "; "))
 	}
 	if l := d.Lease; l != nil && l.Holder != spec.Holder {

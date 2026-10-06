@@ -179,6 +179,18 @@ type StageArgs struct {
 	// console. Otherwise a test boot keeps the base's own; a Mac with a serial
 	// console is always verbose.
 	Verbose bool `json:"verbose,omitempty"`
+	// Installed boots an installed release through its installer-made Limine
+	// entry instead of staging a kernel (the installed-kernel job mode).
+	Installed *InstalledStage `json:"installed,omitempty"`
+}
+
+// InstalledStage points a one-shot lab entry at the installer's own UKI, with
+// the installer's cmdline plus only the lab's additions.
+type InstalledStage struct {
+	Path      string `json:"path"`       // the installer entry's path: line, verbatim (with its #hash)
+	UKISHA256 string `json:"uki_sha256"` // the UKI file must have this sha256
+	Cmdline   string `json:"cmdline"`    // the full cmdline to boot
+	Release   string `json:"release"`    // the kernel release the UKI carries
 }
 
 type StageResult struct {
@@ -293,6 +305,12 @@ type JobSpec struct {
 	// (it lacks a feature on purpose): they're listed, not counted as regressions.
 	// "hardware.drivers:<compatible>" allows just that device-tree node to go unbound.
 	OMTAllow []string `json:"omt_allow,omitempty"`
+	// InstalledManifest is the sha256 of a frozen expected manifest
+	// (frozen/<release>/expected/manifest.json): the job boots the release as
+	// the installer installed it, checks its identity against the frozen
+	// expectation before, on and after the boot, compares omarchy-m-test and
+	// kernel errors with the frozen pre-install baseline, and never promotes.
+	InstalledManifest string `json:"installed_manifest,omitempty"`
 }
 
 type JobEvent struct {
@@ -301,17 +319,32 @@ type JobEvent struct {
 }
 
 type JobResult struct {
-	Booted        bool          `json:"booted"`
-	BootKernel    string        `json:"boot_kernel,omitempty"`
-	BootCmdline   string        `json:"boot_cmdline,omitempty"` // /proc/cmdline of the test boot
-	BootSeconds   float64       `json:"boot_seconds,omitempty"`
-	FellBack      bool          `json:"fell_back,omitempty"`
-	Recovery      []string      `json:"recovery,omitempty"` // ladder steps that were needed
-	Tests         []TestResult  `json:"tests,omitempty"`
-	KernelEvents  []KernelEvent `json:"kernel_events,omitempty"`
-	NewErrorLines []string      `json:"new_error_lines,omitempty"` // dmesg errors not in the baseline
-	Logs          []string      `json:"logs,omitempty"`
-	OMT           *OMTResult    `json:"omt,omitempty"` // omarchy-m-test, when it ran
+	Booted        bool             `json:"booted"`
+	BootKernel    string           `json:"boot_kernel,omitempty"`
+	BootCmdline   string           `json:"boot_cmdline,omitempty"` // /proc/cmdline of the test boot
+	BootSeconds   float64          `json:"boot_seconds,omitempty"`
+	FellBack      bool             `json:"fell_back,omitempty"`
+	Recovery      []string         `json:"recovery,omitempty"` // ladder steps that were needed
+	Tests         []TestResult     `json:"tests,omitempty"`
+	KernelEvents  []KernelEvent    `json:"kernel_events,omitempty"`
+	NewErrorLines []string         `json:"new_error_lines,omitempty"` // dmesg errors not in the baseline
+	Logs          []string         `json:"logs,omitempty"`
+	OMT           *OMTResult       `json:"omt,omitempty"` // omarchy-m-test, when it ran
+	Installed     *InstalledResult `json:"installed,omitempty"`
+}
+
+// InstalledResult is an installed-mode job's verdicts. The evidence files are
+// in the job's installed/ directory and the frozen store.
+type InstalledResult struct {
+	Release        string            `json:"release"`
+	ManifestSHA256 string            `json:"manifest_sha256"`
+	EntrySHA256    string            `json:"installer_entry_sha256"`
+	Before         *TestResult       `json:"before,omitempty"` // identity-before: not one of Tests
+	Verdicts       map[string]string `json:"verdicts"`         // phase -> MATCH/MISMATCH/INCOMPLETE
+	OMT            string            `json:"omt,omitempty"`    // NO_REGRESSION or REGRESSION
+	Dmesg          string            `json:"dmesg,omitempty"`  // NONE_NEW, REVIEW_REQUIRED or FATAL
+	Evidence       []string          `json:"evidence,omitempty"`
+	Frozen         string            `json:"frozen_copy,omitempty"`
 }
 
 // OMTResult summarizes an omarchy-m-test report (github.com/maralcbr/omarchy-m-testing)
@@ -333,6 +366,7 @@ type OMTResult struct {
 	ComparedTo  string     `json:"compared_to,omitempty"`  // the baseline job, or why there was no comparison
 	Published   string     `json:"published,omitempty"`    // the report's page on omarchy-m-testing.org
 	PublishNote string     `json:"publish_note,omitempty"` // why it wasn't published, or the site's error
+	Reference   string     `json:"reference,omitempty"`    // a known-good run: whether it became the reference, or why not
 }
 
 type OMTCheck struct {

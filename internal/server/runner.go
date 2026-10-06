@@ -11,6 +11,7 @@ import (
 
 	"github.com/iconidentify/maclab/internal/api"
 	"github.com/iconidentify/maclab/internal/detect"
+	"github.com/iconidentify/maclab/internal/installed"
 )
 
 type jobRun struct {
@@ -26,6 +27,10 @@ type jobRun struct {
 
 	armedBoot string    // the boot that was running when this job armed its one-shot and rebooted
 	armedAt   time.Time // when it did
+
+	ir *installedRun // installed-kernel jobs only
+
+	omtRef []byte // a known-good run's omarchy-m-test reference, written only if the job passes
 }
 
 func (r *jobRun) ev(format string, args ...any) {
@@ -165,7 +170,14 @@ func (s *Server) runJob(ctx context.Context, v *dev, j *api.Job) {
 		v.mu.Unlock()
 		summary += fmt.Sprintf(". %s is in the pool (known-good kernel %s)", j.Spec.Device, v.snapshot().Kernel)
 	}
+	if r.omtRef != nil {
+		r.promoteOMT(outcome)
+	}
 	r.finish(outcome, summary)
+	if r.ir != nil {
+		// after finish, so the evidence copy carries the outcome and summary
+		r.ir.finish()
+	}
 }
 
 func (r *jobRun) finish(outcome, summary string) {
@@ -182,16 +194,40 @@ func (r *jobRun) finish(outcome, summary string) {
 func (r *jobRun) execute(ctx context.Context) (string, string) {
 	v, j := r.v, r.j
 
+	if j.Spec.InstalledManifest != "" {
+		ir, err := r.newInstalled()
+		if err != nil {
+			return api.OutcomeInfra, "installed job: " + err.Error()
+		}
+		r.ir = ir
+		r.ev("installed %s: manifest %s, installer entry %s", ir.c.release, short(ir.c.manSHA), short(ir.c.entrySHA))
+		// identity-before runs on whatever boot is current; it is not one of the job's tests
+		r.state(api.JobTesting)
+		tr := r.runTest(ctx, ir.test(installed.PhaseBefore))
+		reason := ir.identity(installed.PhaseBefore, &tr)
+		ir.res.Before = &tr
+		r.s.updateJob(j, func(j *api.Job) { j.Result.Installed = &ir.res })
+		if reason != "" {
+			return api.OutcomeTestsFailed, "installed state does not match the frozen expectation before boot: " + reason
+		}
+	}
+
 	r.state(api.JobStaging)
 	var sr api.StageResult
 	what := "current kernel"
 	if j.Spec.Kernel != "" {
 		what = "kernel " + short(j.Spec.Kernel)
 	}
+	if r.ir != nil {
+		what = "installed " + r.ir.c.man.Kernel.Release + " through the installer's entry"
+	}
 	r.ev("staging %s", what)
 	d := v.snapshot()
 	args := api.StageArgs{Artifact: j.Spec.Kernel, Cmdline: j.Spec.Cmdline, Serial: d.OOB != nil,
 		CmdlineBase: j.Spec.CmdlineBase, CmdlineStrip: j.Spec.CmdlineStrip, Verbose: j.Spec.VerboseBoot}
+	if r.ir != nil {
+		args = api.StageArgs{Serial: d.OOB != nil, Installed: r.ir.stageArgs()}
+	}
 	if err := v.call(ctx, api.CmdStage, j.ID, args, 20*time.Minute, &sr); err != nil {
 		return api.OutcomeStageFailed, "staging failed: " + err.Error()
 	}
@@ -249,7 +285,11 @@ func (r *jobRun) execute(ctx context.Context) (string, string) {
 
 	r.state(api.JobTesting)
 	failed := 0
-	for _, t := range testsFor(j.Spec) {
+	tests := testsFor(j.Spec)
+	if r.ir != nil {
+		tests = append(append([]api.TestSpec{r.ir.test(installed.PhaseBooted)}, tests...), r.ir.test(installed.PhaseAfter))
+	}
+	for _, t := range tests {
 		timeout := time.Duration(t.TimeoutSec)*time.Second + 2*time.Minute
 		if t.TimeoutSec == 0 {
 			timeout = 7 * time.Minute
@@ -266,12 +306,22 @@ func (r *jobRun) execute(ctx context.Context) (string, string) {
 		if t.Builtin == omtTest && err == nil {
 			r.omtResult(&tr)
 		}
+		if r.ir != nil && err == nil {
+			switch t.Name {
+			case installed.TestName(installed.PhaseBooted):
+				r.ir.identity(installed.PhaseBooted, &tr)
+			case installed.TestName(installed.PhaseAfter):
+				r.ir.identity(installed.PhaseAfter, &tr)
+			}
+			r.s.updateJob(j, func(j *api.Job) { j.Result.Installed = &r.ir.res })
+		}
 		if !tr.Passed {
 			failed++
 		}
 		r.s.updateJob(j, func(j *api.Job) { j.Result.Tests = append(j.Result.Tests, tr) })
 		r.ev("test %s: %s", t.Name, testVerdict(tr))
 	}
+	nTests := len(tests)
 	if omt := r.currentOMT(); omt != nil && (j.Spec.Publish || (r.s.cfg.OMTPublish && j.Spec.Baseline)) {
 		if url, err := r.s.omtPublish(ctx, j); err != nil {
 			r.ev("omarchy-m-test report not published: %v", err)
@@ -289,10 +339,18 @@ func (r *jobRun) execute(ctx context.Context) (string, string) {
 		}
 	}
 	var newLines []string
+	var dmesgFatal []string
 	for _, f := range files {
 		if strings.HasSuffix(f, "/dmesg-errors.txt") {
 			got, _ := os.ReadFile(filepath.Join(r.s.jobDir(j.ID), f))
-			if j.Spec.Baseline {
+			if r.ir != nil {
+				dc := r.ir.dmesg(got)
+				newLines = dc.NewLines
+				for _, h := range dc.FatalHits {
+					dmesgFatal = append(dmesgFatal, h.Kind+": "+h.Line)
+				}
+				r.s.updateJob(j, func(j *api.Job) { j.Result.Installed = &r.ir.res })
+			} else if j.Spec.Baseline {
 				os.WriteFile(r.s.baselinePath(d.Name), got, 0o644)
 			} else if base, err := os.ReadFile(r.s.baselinePath(d.Name)); err == nil {
 				newLines = detect.NewLines(string(base), string(got))
@@ -314,17 +372,34 @@ func (r *jobRun) execute(ctx context.Context) (string, string) {
 
 	switch {
 	case failed > 0:
-		return api.OutcomeTestsFailed, fmt.Sprintf("booted %s; %d of %d tests failed", d.Kernel, failed, len(testsFor(j.Spec)))
+		return api.OutcomeTestsFailed, fmt.Sprintf("booted %s; %d of %d tests failed", d.Kernel, failed, nTests)
+	case len(dmesgFatal) > 0:
+		return api.OutcomeUnhealthy, fmt.Sprintf("booted %s but its kernel errors include %s", d.Kernel, dmesgFatal[0])
 	case len(fatal) > 0:
 		return api.OutcomeUnhealthy, fmt.Sprintf("booted %s but the kernel logged %s: %s", d.Kernel, fatal[0].Kind, fatal[0].Line)
 	case health.SystemState != "running" && health.SystemState != "degraded":
 		return api.OutcomeUnhealthy, fmt.Sprintf("booted %s but systemd is %q", d.Kernel, health.SystemState)
 	}
-	sum := fmt.Sprintf("booted %s in %.0fs, %d tests passed", d.Kernel, secs, len(testsFor(j.Spec)))
+	sum := fmt.Sprintf("booted %s in %.0fs, %d tests passed", d.Kernel, secs, nTests)
+	if r.ir != nil {
+		sum += fmt.Sprintf(", identity %s/%s/%s, omt %s, kernel errors %s", r.ir.res.Verdicts[installed.PhaseBefore],
+			r.ir.res.Verdicts[installed.PhaseBooted], r.ir.res.Verdicts[installed.PhaseAfter], r.ir.res.OMT, r.ir.res.Dmesg)
+	}
 	if len(newLines) > 0 {
 		sum += fmt.Sprintf(", %d new kernel warning/error lines vs baseline", len(newLines))
 	}
 	return api.OutcomePass, sum
+}
+
+// runTest runs one test outside the job's test list (identity-before).
+func (r *jobRun) runTest(ctx context.Context, t api.TestSpec) api.TestResult {
+	r.ev("test %s: running", t.Name)
+	var tr api.TestResult
+	if err := r.v.callNote(ctx, api.CmdRunTest, r.j.ID, t, time.Duration(t.TimeoutSec)*time.Second+2*time.Minute, &tr, func(n string) { r.ev("%s", n) }); err != nil {
+		tr = api.TestResult{Name: t.Name, ExitCode: -1, Error: err.Error()}
+	}
+	r.ev("test %s: %s", t.Name, testVerdict(tr))
+	return tr
 }
 
 func (r *jobRun) currentOMT() *api.OMTResult {

@@ -64,15 +64,18 @@ type lab struct {
 	mu     sync.Mutex
 	cancel context.CancelFunc
 	url    string
+	name   string // the simulated Mac
 }
 
-func newLab(t *testing.T, withOOB bool) *lab {
+func newLab(t *testing.T, withOOB bool) *lab { return newLabNamed(t, withOOB, "sim-mac") }
+
+func newLabNamed(t *testing.T, withOOB bool, name string) *lab {
 	aliveWindow = 1500 * time.Millisecond
 	panicGrace = 2 * time.Second
 	serialStall = 3 * time.Second
 	quietGrace = 3 * time.Second
 	ctx, cancel := context.WithCancel(context.Background())
-	l := &lab{t: t, cancel: cancel}
+	l := &lab{t: t, cancel: cancel, name: name}
 	sim := agent.NewSim(t.TempDir())
 	sim.RebootDelay = 300 * time.Millisecond
 	l.sim = sim
@@ -100,7 +103,7 @@ func newLab(t *testing.T, withOOB bool) *lab {
 	t.Cleanup(func() { cancel(); hs.Close() })
 
 	// Enroll the simulated Mac exactly as lab-agent setup would.
-	tok, _ := s.store.addTokenForTest("sim-mac")
+	tok, _ := s.store.addTokenForTest(name)
 	resp, err := agent.Enroll(ctx, hs.URL, tok, sim.Facts())
 	if err != nil {
 		t.Fatal(err)
@@ -108,7 +111,7 @@ func newLab(t *testing.T, withOOB bool) *lab {
 	a := agent.New(&agent.Config{Server: hs.URL, DeviceID: resp.DeviceID, Name: resp.Name, Secret: resp.Secret, WorkDir: t.TempDir()}, sim, quiet)
 	go a.Run(ctx)
 	if withOOB {
-		v := s.dev("sim-mac")
+		v := s.dev(name)
 		v.mu.Lock()
 		v.d.OOB = &api.OOBConfig{Driver: "fake"}
 		v.mu.Unlock()
@@ -145,7 +148,7 @@ func putArtifactForTest(s *Server, content string) (string, error) {
 
 func (l *lab) run(spec api.JobSpec) *api.Job {
 	l.t.Helper()
-	spec.Device = "sim-mac"
+	spec.Device = l.name
 	j, _, err := l.s.Submit(spec)
 	if err != nil {
 		l.t.Fatal(err)
@@ -182,13 +185,13 @@ func (l *lab) waitDevice(cond func(api.Device) bool) api.Device {
 	l.t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
-		d := l.s.dev("sim-mac").snapshot()
+		d := l.s.dev(l.name).snapshot()
 		if cond(d) {
 			return d
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	d := l.s.dev("sim-mac").snapshot()
+	d := l.s.dev(l.name).snapshot()
 	l.t.Fatalf("device condition not met: state=%s reason=%s kernel=%s", d.State, d.StateReason, d.Kernel)
 	return d
 }
@@ -723,6 +726,20 @@ func TestOmarchyMTest(t *testing.T) {
 	}
 	if len(posts) != 1 {
 		t.Fatalf("site got %d posts, want 1", len(posts))
+	}
+
+	// A known-good run whose job fails keeps the old reference; a clean one replaces it.
+	ref, _ := os.ReadFile(l.s.omtBaselinePath("sim-mac"))
+	l.s.cfg.OMTPublish = false
+	j = l.run(api.JobSpec{Tests: []api.TestSpec{{Name: "check-that-will-fail", Builtin: "x"}}})
+	l.expect(j, api.OutcomeTestsFailed)
+	if now, _ := os.ReadFile(l.s.omtBaselinePath("sim-mac")); !bytes.Equal(ref, now) || !strings.HasPrefix(j.Result.OMT.Reference, "kept") {
+		t.Fatalf("a failed known-good job replaced the reference (%s)", j.Result.OMT.Reference)
+	}
+	j = l.run(api.JobSpec{})
+	l.expect(j, api.OutcomePass)
+	if now, _ := os.ReadFile(l.s.omtBaselinePath("sim-mac")); !strings.Contains(string(now), j.ID) || j.Result.OMT.Reference != "became the reference" {
+		t.Fatalf("a clean known-good job did not become the reference (%s)", j.Result.OMT.Reference)
 	}
 }
 
