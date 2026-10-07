@@ -126,7 +126,8 @@ func TestStageInstalledChecksBlake2bPin(t *testing.T) {
 	if got, _ := fileBlake2b(filepath.Join(esp, "EFI/Linux/x.efi")); got != abc {
 		t.Fatalf("fileBlake2b: %s", got)
 	}
-	bootPartitionLock = filepath.Join(t.TempDir(), "boot-partition.lock")
+	locks := t.TempDir()
+	bootPartitionLocks = []string{filepath.Join(locks, "boot-partition.lock"), filepath.Join(locks, "limine-global.lock")}
 	stage := func(pin string) error {
 		_, err := (&Linux{}).stageInstalled("j1", &api.InstalledStage{Path: "boot():/EFI/Linux/x.efi#" + pin, UKISHA256: hex.EncodeToString(sum[:]),
 			Cmdline: "root=UUID=x rw maclab.job=j1 panic=10", Release: "12.0"}, l, t.TempDir())

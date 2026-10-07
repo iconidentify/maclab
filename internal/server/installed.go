@@ -38,7 +38,7 @@ import (
 	"github.com/iconidentify/maclab/internal/installed"
 )
 
-const installedMinAgent = "0.7.1" // collect-status.txt
+const installedMinAgent = "0.7.2" // collect-status.txt; both ESP locks
 
 var reRelease = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z._-]*$`)
 

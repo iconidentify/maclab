@@ -135,28 +135,44 @@ var reMaclabBlock = regexp.MustCompile(`(?s)\n?` + regexp.QuoteMeta(limineBegin)
 
 // writeEntries rewrites the marked block at the end of limine.conf from every
 // staged job, leaving everything else in the file as it was.
-// bootPartitionLock is the lock limine-snapper-sync, limine-entry-tool and the
-// rest of Omarchy's Limine tooling take (/usr/lib/limine/limine-mutex) before
-// they touch limine.conf or other files on the ESP. Its README asks every other
-// tool to take it too. Without it, a snapshot sync rewriting limine.conf could
-// interleave with ours and drop the lab's block, staged entry included.
-var bootPartitionLock = "/run/lock/boot-partition.lock"
+// bootPartitionLocks are the locks Omarchy's Limine tools (limine-entry-tool,
+// limine-snapper-sync, through /usr/lib/limine/limine-mutex) take before they
+// touch limine.conf or other files on the ESP. Newer versions take
+// /run/lock/boot-partition.lock (limine-snapper-sync 1.32 on the m1air); older
+// ones take /tmp/limine-global.lock (1.30.1 on mbp13). Their README asks every
+// other tool to take the lock too. The lab takes both, always in this order;
+// each Limine tool takes only one, so this can't deadlock with them. Without
+// them, a snapshot sync rewriting limine.conf could interleave with ours and
+// drop the lab's block, staged entry included.
+var bootPartitionLocks = []string{"/run/lock/boot-partition.lock", "/tmp/limine-global.lock"}
 
 func lockBootPartition(timeout time.Duration) (func(), error) {
-	os.MkdirAll(filepath.Dir(bootPartitionLock), 0o755)
-	f, err := os.OpenFile(bootPartitionLock, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		return nil, err
-	}
 	deadline := time.Now().Add(timeout)
-	for unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB) != nil {
-		if time.Now().After(deadline) {
-			f.Close()
-			return nil, fmt.Errorf("%s has been held by another tool (limine-snapper-sync?) for over %s", bootPartitionLock, timeout)
+	var held []*os.File
+	release := func() {
+		for i := len(held) - 1; i >= 0; i-- {
+			unix.Flock(int(held[i].Fd()), unix.LOCK_UN)
+			held[i].Close()
 		}
-		time.Sleep(200 * time.Millisecond)
 	}
-	return func() { unix.Flock(int(f.Fd()), unix.LOCK_UN); f.Close() }, nil
+	for _, path := range bootPartitionLocks {
+		os.MkdirAll(filepath.Dir(path), 0o755)
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+		if err != nil {
+			release()
+			return nil, err
+		}
+		for unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB) != nil {
+			if time.Now().After(deadline) {
+				f.Close()
+				release()
+				return nil, fmt.Errorf("%s has been held by another tool (limine-snapper-sync?) for over %s", path, timeout)
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		held = append(held, f)
+	}
+	return release, nil
 }
 
 func (l *limineLayout) writeEntries() error {
