@@ -56,7 +56,8 @@ type Sim struct {
 	// instead of SimKnownGood; RecordedKnownGood is the agent's record.
 	DefaultKernel     string
 	RecordedKnownGood string
-	// KnownGoodHook, when set, answers record_known_good instead.
+	// KnownGoodHook, when set, answers record_known_good instead; set it with
+	// SetKnownGoodHook once the agent runs.
 	KnownGoodHook func(kernel string) error
 	// CollectHook, when set, replaces log collection: it may write other files or fail.
 	CollectHook func(boot, outDir string) error
@@ -439,8 +440,11 @@ func (s *Sim) omtReport(t api.TestSpec, outDir, behavior string) api.TestResult 
 }
 
 func (s *Sim) RecordKnownGood(kernel string) error {
-	if s.KnownGoodHook != nil {
-		return s.KnownGoodHook(kernel)
+	s.mu.Lock()
+	hook := s.KnownGoodHook
+	s.mu.Unlock()
+	if hook != nil {
+		return hook(kernel)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -449,4 +453,11 @@ func (s *Sim) RecordKnownGood(kernel string) error {
 	}
 	s.RecordedKnownGood = kernel
 	return nil
+}
+
+// SetKnownGoodHook sets KnownGoodHook while the agent runs.
+func (s *Sim) SetKnownGoodHook(f func(kernel string) error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.KnownGoodHook = f
 }

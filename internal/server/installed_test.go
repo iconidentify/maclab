@@ -294,7 +294,7 @@ func TestInstalledJob(t *testing.T) {
 			t.Fatalf("%s: kept copies left behind: %v", why, left)
 		}
 	}
-	l.sim.KnownGoodHook = func(string) error { return errors.New("refused for the test") }
+	l.sim.SetKnownGoodHook(func(string) error { return errors.New("refused for the test") })
 	if resp, body := promote(); resp.StatusCode != 500 || !strings.Contains(body, "did not record") ||
 		strings.Contains(body, "it may have") || !strings.Contains(body, "previous references were put back") {
 		t.Fatalf("promote with the agent refusing: %s %s", resp.Status, body)
@@ -307,13 +307,13 @@ func TestInstalledJob(t *testing.T) {
 	// the command gets no answer: put back too, saying the agent may have recorded it
 	saved := recordKnownGoodTimeout
 	recordKnownGoodTimeout = 300 * time.Millisecond
-	l.sim.KnownGoodHook = func(string) error { time.Sleep(2 * time.Second); return nil }
+	l.sim.SetKnownGoodHook(func(string) error { time.Sleep(2 * time.Second); return nil })
 	if resp, body := promote(); resp.StatusCode != 500 || !strings.Contains(body, "it may have") {
 		t.Fatalf("promote with the agent not answering: %s %s", resp.Status, body)
 	}
 	recordKnownGoodTimeout = saved
 	time.Sleep(2500 * time.Millisecond)
-	l.sim.KnownGoodHook = nil
+	l.sim.SetKnownGoodHook(nil)
 	unchanged("agent did not answer")
 	keptGone("agent did not answer")
 	if n := ledgerFailures(); n != 2 {
