@@ -156,7 +156,10 @@ func lockBootPartition(timeout time.Duration) (func(), error) {
 		}
 	}
 	for _, path := range bootPartitionLocks {
-		os.MkdirAll(filepath.Dir(path), 0o755)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			release()
+			return nil, fmt.Errorf("lock %s: %w", path, err)
+		}
 		// /tmp and /run/lock are world-writable: never follow a symlink planted
 		// there, never block opening a FIFO, and lock only a regular file
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0o644)
@@ -169,7 +172,17 @@ func lockBootPartition(timeout time.Duration) (func(), error) {
 			release()
 			return nil, fmt.Errorf("lock %s is not a regular file; refusing to use it", path)
 		}
-		for unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB) != nil {
+		for {
+			err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+			if err == nil {
+				break
+			}
+			// only contention (or an interrupted call) is worth waiting out
+			if err != unix.EWOULDBLOCK && err != unix.EINTR {
+				f.Close()
+				release()
+				return nil, fmt.Errorf("lock %s: %w", path, err)
+			}
 			if time.Now().After(deadline) {
 				f.Close()
 				release()

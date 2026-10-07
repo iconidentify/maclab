@@ -3,6 +3,7 @@ package agent
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -59,8 +60,10 @@ func waitsFor(t *testing.T, held string) {
 	}
 }
 
-// A lock path that isn't a plain file (a symlink or FIFO planted in /tmp, a
-// directory) is refused at once: no symlink followed, no blocking open.
+// A lock path that isn't a plain file is refused at once: a symlink planted in
+// /tmp is not followed (its target is not created), and a FIFO or a directory is
+// refused as not regular. The one-second guard only keeps a regression from
+// hanging the test.
 func TestBootPartitionLockRefusesNonRegularFiles(t *testing.T) {
 	for name, plant := range map[string]func(p, dir string) error{
 		"symlink":   func(p, dir string) error { return os.Symlink(filepath.Join(dir, "victim"), p) },
@@ -87,7 +90,7 @@ func TestBootPartitionLockRefusesNonRegularFiles(t *testing.T) {
 					t.Fatal("locked through a non-regular file")
 				}
 			case <-time.After(time.Second):
-				t.Fatal("blocked on the lock path")
+				t.Fatal("lockBootPartition did not return within the guard")
 			}
 			if _, err := os.Lstat(filepath.Join(dir, "victim")); err == nil {
 				t.Fatal("followed the symlink and created its target")
@@ -99,5 +102,22 @@ func TestBootPartitionLockRefusesNonRegularFiles(t *testing.T) {
 				t.Fatal("first lock not released after the refusal")
 			}
 		})
+	}
+}
+
+// A lock directory that can't be created is an error, and the lock already
+// taken is released.
+func TestBootPartitionLockReportsUncreatableDirectory(t *testing.T) {
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "not-a-dir")
+	os.WriteFile(blocker, nil, 0o644)
+	bootPartitionLocks = []string{filepath.Join(dir, "boot-partition.lock"), filepath.Join(blocker, "limine-global.lock")}
+	if _, err := lockBootPartition(time.Second); err == nil || !strings.Contains(err.Error(), "not-a-dir") {
+		t.Fatalf("uncreatable lock directory: %v", err)
+	}
+	f, _ := os.OpenFile(bootPartitionLocks[0], os.O_RDWR, 0)
+	defer f.Close()
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatal("first lock not released after the error")
 	}
 }
