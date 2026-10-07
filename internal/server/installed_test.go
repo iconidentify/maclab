@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/iconidentify/maclab/internal/agent"
 	"github.com/iconidentify/maclab/internal/api"
 	"github.com/iconidentify/maclab/internal/installed"
 )
@@ -112,6 +113,7 @@ func installedLab(t *testing.T, tamper func(phase string, o map[string]any)) (*l
 	os.WriteFile(filepath.Join(dir, "PINS.installer-entry.sim-mac"), []byte(pinsFor(dir, "installer-entry/sim-mac.json")), 0o444)
 
 	l.sim.PackagedKernels = []string{tKrel}
+	l.sim.DefaultKernel = tKrel // the installer has run: a plain reboot comes up on it
 	l.sim.InstalledObs = func(phase, job, bootID, kernel, cmdline string) []byte {
 		stage2 := "v1.6.1-omarchy.sim"
 		if phase == installed.PhaseBefore {
@@ -281,9 +283,55 @@ func TestInstalledJob(t *testing.T) {
 	os.Remove(ledger)
 	unchanged("unwritable ledger")
 
+	// the agent refuses to record the known-good: everything is put back
+	ledgerFailures := func() int {
+		b, _ := os.ReadFile(ledger)
+		return strings.Count(string(b), "\tFAILED\t")
+	}
+	keptGone := func(why string) {
+		t.Helper()
+		if left, _ := filepath.Glob(filepath.Join(bdir, "*.before-"+j.ID)); len(left) > 0 {
+			t.Fatalf("%s: kept copies left behind: %v", why, left)
+		}
+	}
+	l.sim.KnownGoodHook = func(string) error { return errors.New("refused for the test") }
+	if resp, body := promote(); resp.StatusCode != 500 || !strings.Contains(body, "did not record") ||
+		strings.Contains(body, "it may have") || !strings.Contains(body, "previous references were put back") {
+		t.Fatalf("promote with the agent refusing: %s %s", resp.Status, body)
+	}
+	unchanged("agent refused")
+	keptGone("agent refused")
+	if n := ledgerFailures(); n != 1 {
+		t.Fatalf("agent refused: %d FAILED ledger records, want 1", n)
+	}
+	// the command gets no answer: put back too, saying the agent may have recorded it
+	saved := recordKnownGoodTimeout
+	recordKnownGoodTimeout = 300 * time.Millisecond
+	l.sim.KnownGoodHook = func(string) error { time.Sleep(2 * time.Second); return nil }
+	if resp, body := promote(); resp.StatusCode != 500 || !strings.Contains(body, "it may have") {
+		t.Fatalf("promote with the agent not answering: %s %s", resp.Status, body)
+	}
+	recordKnownGoodTimeout = saved
+	time.Sleep(2500 * time.Millisecond)
+	l.sim.KnownGoodHook = nil
+	unchanged("agent did not answer")
+	keptGone("agent did not answer")
+	if n := ledgerFailures(); n != 2 {
+		t.Fatalf("agent did not answer: %d FAILED ledger records, want 2", n)
+	}
+
 	resp, body := promote()
 	if resp.StatusCode != 200 || l.s.dev("sim-mac").snapshot().KnownGood != tKrel {
 		t.Fatalf("promote: %s %s", resp.Status, body)
+	}
+	if l.sim.RecordedKnownGood != tKrel {
+		t.Fatalf("the agent's known-good is %q, not %s", l.sim.RecordedKnownGood, tKrel)
+	}
+	// the live references stay writable: lab baseline replaces them later
+	for _, p := range []string{l.s.omtBaselinePath("sim-mac"), l.s.baselinePath("sim-mac")} {
+		if fi, err := os.Stat(p); err != nil || fi.Mode().Perm() != 0o644 {
+			t.Fatalf("%s after promotion: %v %v", p, fi.Mode(), err)
+		}
 	}
 	if resp, _ := promote(); resp.StatusCode != 409 {
 		t.Fatalf("second promote: %s", resp.Status)
@@ -293,6 +341,62 @@ func TestInstalledJob(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(filepath.Join(l.s.frozenDir("9.9"), "promotions.log")); !strings.Contains(string(b), j.ID+"\t"+tKrel+"\taccepted-by=dave") {
 		t.Fatalf("promotions.log: %q", b)
+	}
+	// a read-only kernel error reference, as an earlier labd's promotion left
+	// it, is still replaced by the next baseline
+	bp := l.s.baselinePath("sim-mac")
+	os.Chmod(bp, 0o644)
+	os.WriteFile(bp, []byte("stale\n"), 0o444)
+	os.Chmod(bp, 0o444)
+	if bj := l.run(api.JobSpec{Baseline: true, Holder: "tester"}); bj.Outcome != api.OutcomePass {
+		t.Fatalf("baseline after promotion: %s %s", bj.Outcome, bj.Summary)
+	}
+	if b, _ := os.ReadFile(bp); string(b) == "stale\n" {
+		t.Fatal("the baseline did not replace a read-only kernel error reference")
+	}
+}
+
+func TestPromoteNeedsTheInstalledKernel(t *testing.T) {
+	l, msha, _ := installedLab(t, nil)
+	j := l.run(api.JobSpec{InstalledManifest: msha, Holder: "tester"})
+	l.expect(j, api.OutcomePass)
+	kg := l.s.dev("sim-mac").snapshot().KnownGood
+	ledger := filepath.Join(l.s.frozenDir("9.9"), "promotions.log")
+	promote := func() (*http.Response, string) {
+		return l.post("/api/installed/9.9/promote", map[string]any{"device": "sim-mac", "job": j.ID, "accepted_by": "dave"})
+	}
+	refused := func(why, want string) {
+		t.Helper()
+		if resp, body := promote(); resp.StatusCode != 409 || !strings.Contains(body, want) {
+			t.Fatalf("%s: %s %s", why, resp.Status, body)
+		}
+		if got := l.s.dev("sim-mac").snapshot().KnownGood; got != kg || l.sim.RecordedKnownGood != "" {
+			t.Fatalf("%s: known-good %s, agent's %q", why, got, l.sim.RecordedKnownGood)
+		}
+		if _, err := os.Stat(ledger); !os.IsNotExist(err) {
+			t.Fatalf("%s: the ledger was written (%v)", why, err)
+		}
+	}
+	// back on the old kernel
+	l.sim.DefaultKernel = ""
+	l.sim.Reboot()
+	l.waitDevice(func(d api.Device) bool { return d.Kernel == agent.SimKnownGood })
+	refused("old kernel", "boot it first")
+	l.sim.DefaultKernel = tKrel
+	l.sim.Reboot()
+	l.waitDevice(func(d api.Device) bool { return d.Kernel == tKrel })
+	// an agent that can't record the known-good
+	v := l.s.dev("sim-mac")
+	v.mu.Lock()
+	ver := v.d.Facts.AgentVersion
+	v.d.Facts.AgentVersion = "0.7.2"
+	v.mu.Unlock()
+	refused("old agent", "needs 0.7.3")
+	v.mu.Lock()
+	v.d.Facts.AgentVersion = ver
+	v.mu.Unlock()
+	if resp, body := promote(); resp.StatusCode != 200 || l.sim.RecordedKnownGood != tKrel {
+		t.Fatalf("promote on the installed kernel: %s %s", resp.Status, body)
 	}
 }
 

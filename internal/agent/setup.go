@@ -167,13 +167,62 @@ func Setup(ctx context.Context, o SetupOptions) error {
 	return nil
 }
 
+// RecordKnownGood re-records the known-good kernel after a promotion: the Mac
+// must be running exactly kernel, outside a lab boot. The previous record is
+// kept as known-good.json.prev.
+func (l *Linux) RecordKnownGood(kernel string) error {
+	_, running, cmdline := l.Identity()
+	if err := recordable(kernel, running, cmdline); err != nil {
+		return err
+	}
+	b, err := detectBootloader()
+	if err != nil {
+		return err
+	}
+	if old, err := os.ReadFile(l.knownGoodPath()); err == nil {
+		if err := os.WriteFile(l.knownGoodPath()+".prev", old, 0o644); err != nil {
+			return err
+		}
+	}
+	return recordKnownGood(l, b, kernel, cmdline)
+}
+
+// recordable says whether the running kernel may become known-good as kernel.
+func recordable(kernel, running, cmdline string) error {
+	switch {
+	case kernel == "" || running != kernel:
+		return fmt.Errorf("running %s, not %q: boot it before recording it as known-good", running, kernel)
+	case jobTag(cmdline) != "":
+		return fmt.Errorf("running a lab boot (job %s), not the installed entry", jobTag(cmdline))
+	}
+	return nil
+}
+
 func recordKnownGood(l *Linux, bl bootloader, kernel, cmdline string) error {
 	kg, err := computeKnownGood(bl, kernel, cmdline)
 	if err != nil {
 		return err
 	}
 	b, _ := json.MarshalIndent(kg, "", "  ")
-	return os.WriteFile(l.knownGoodPath(), b, 0o644)
+	// replaced whole: preflight never reads half a record
+	tmp := l.knownGoodPath() + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err = f.Write(b); err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp, l.knownGoodPath())
+	}
+	if err != nil {
+		os.Remove(tmp)
+	}
+	return err
 }
 
 // DescribeKnownGood shows what setup would record, without changing anything.

@@ -368,7 +368,10 @@ func (r *jobRun) execute(ctx context.Context) (string, string) {
 		if strings.HasSuffix(f, "/dmesg-errors.txt") && r.ir == nil {
 			got, _ := os.ReadFile(filepath.Join(r.s.jobDir(j.ID), f))
 			if j.Spec.Baseline {
-				os.WriteFile(r.s.baselinePath(d.Name), got, 0o644)
+				// atomic, so a read-only reference (promotions before 0.7.3) is replaced too
+				if err := writeFileAtomic(r.s.baselinePath(d.Name), got); err != nil {
+					r.ev("kernel error baseline not updated: %v", err)
+				}
 			} else if base, err := os.ReadFile(r.s.baselinePath(d.Name)); err == nil {
 				newLines = detect.NewLines(string(base), string(got))
 			}

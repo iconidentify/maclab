@@ -46,6 +46,7 @@ const usage = `lab: run kernels and tests on Omarchy Macs
   lab installed freeze-manifest --release R <manifest.json> <payload.sha256> [--approved-by a,b]
   lab installed freeze-entry <device> --release R    freeze the installer's boot entry, after the install
   lab installed promote <device> --release R --job <id> --accepted-by <who>
+                                      references + known-good, labd's and the agent's (Mac on that kernel, agent 0.7.3+)
   lab installed status --release R                   the frozen files of a release
   lab reset <device>                  run the recovery ladder on an idle Mac by hand
   lab shell <device>                  shell over the serial link: works with the Mac's network down (Ctrl-] exits)

@@ -148,6 +148,10 @@ const (
 	CmdLogs     = "logs"
 	CmdConfig   = "config" // the running kernel's .config
 	CmdExec     = "exec"
+	// CmdRecordKnownGood makes the running kernel the agent's known-good, as
+	// lab-agent setup does; it refuses unless the Mac runs exactly that kernel
+	// outside a lab boot. Promotion sends it.
+	CmdRecordKnownGood = "record_known_good"
 )
 
 type Command struct {
@@ -230,6 +234,10 @@ type LogsArgs struct {
 	Source string `json:"source"` // journal, kernel
 	Lines  int    `json:"lines"`
 	Unit   string `json:"unit,omitempty"`
+}
+
+type RecordKnownGoodArgs struct {
+	Kernel string `json:"kernel"` // the release the Mac must be running
 }
 
 type CrashArgs struct {

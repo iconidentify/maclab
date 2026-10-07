@@ -40,6 +40,11 @@ import (
 
 const installedMinAgent = "0.7.2" // collect-status.txt; both ESP locks
 
+// promoteMinAgent records the promoted kernel as the agent's own known-good.
+const promoteMinAgent = "0.7.3"
+
+var recordKnownGoodTimeout = time.Minute
+
 var reRelease = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z._-]*$`)
 
 func (s *Server) frozenDir(release string) string {
@@ -548,10 +553,16 @@ func (ir *installedRun) copyFrozen(dst string) error {
 // writeOnce writes a file that must not exist yet, read-only and synced. The
 // create is exclusive, so two writers can't both succeed.
 func writeOnce(path string, b []byte) error {
+	return writeExclusive(path, b, 0o444)
+}
+
+// writeExclusive is writeOnce with the file's mode: promotion stages the live
+// references 0644, since lab baseline rewrites them later.
+func writeExclusive(path string, b []byte, mode os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o444)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if errors.Is(err, os.ErrExist) {
 		return fmt.Errorf("%s already exists; frozen files are written once", path)
 	} else if err != nil {
@@ -863,7 +874,27 @@ func (s *Server) hPromote(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, 404, "no device %s", req.Device)
 		return
 	}
-	line, err := s.promote(v, release, j, req.AcceptedBy, ledger, map[string][]byte{s.omtBaselinePath(req.Device): ob, s.baselinePath(req.Device): dm})
+	// the agent records the promoted kernel as its own known-good last, so the
+	// Mac must be on it now, idle, outside a lab boot
+	v.mu.Lock()
+	d := v.d
+	alive := v.aliveLocked()
+	v.mu.Unlock()
+	switch {
+	case !alive:
+		httpErr(w, 409, "%s is not checking in; promotion records the known-good on the Mac too", d.Name)
+		return
+	case !versionAtLeast(d.Facts.AgentVersion, promoteMinAgent):
+		httpErr(w, 409, "%s runs lab-agent %s; promotion needs %s or later to record the known-good on the Mac", d.Name, orStr(d.Facts.AgentVersion, "(unknown)"), promoteMinAgent)
+		return
+	case d.ActiveJob != "":
+		httpErr(w, 409, "%s is running job %s", d.Name, d.ActiveJob)
+		return
+	case d.Kernel != j.Result.BootKernel || strings.Contains(d.Cmdline, "maclab.job="):
+		httpErr(w, 409, "%s is running %s (cmdline %q), not the installed %s outside a lab boot: boot it first", d.Name, d.Kernel, d.Cmdline, j.Result.BootKernel)
+		return
+	}
+	line, err := s.promote(r.Context(), v, release, j, req.AcceptedBy, ledger, map[string][]byte{s.omtBaselinePath(req.Device): ob, s.baselinePath(req.Device): dm})
 	if err != nil {
 		httpErr(w, 500, "%v", err)
 		return
@@ -921,9 +952,10 @@ func (s *Server) promotionInputs(j *api.Job, report []byte, status map[string]st
 // promote replaces a Mac's references and known-good kernel with an accepted
 // installed job's, all or nothing: the new references are written beside the
 // live ones first, the decision goes into the ledger before anything changes,
-// the old references are kept as <file>.before-<job>, and any failure puts the
-// old ones back and says so in the ledger.
-func (s *Server) promote(v *dev, release string, j *api.Job, by, ledger string, refs map[string][]byte) (string, error) {
+// the old references are kept as <file>.before-<job>, the agent records the
+// kernel as its own known-good last, and any failure puts the old ones back
+// and says so in the ledger.
+func (s *Server) promote(ctx context.Context, v *dev, release string, j *api.Job, by, ledger string, refs map[string][]byte) (string, error) {
 	var paths []string
 	for p := range refs {
 		paths = append(paths, p)
@@ -938,7 +970,7 @@ func (s *Server) promote(v *dev, release string, j *api.Job, by, ledger string, 
 	for _, p := range paths {
 		t := p + ".promote-" + j.ID
 		os.Remove(t)
-		if err := writeOnce(t, refs[p]); err != nil {
+		if err := writeExclusive(t, refs[p], 0o644); err != nil {
 			cleanup()
 			return "", fmt.Errorf("staging %s: %v; nothing was changed", p, err)
 		}
@@ -1019,6 +1051,20 @@ func (s *Server) promote(v *dev, release string, j *api.Job, by, ledger string, 
 	v.mu.Unlock()
 	if err != nil {
 		return "", failed(applied, fmt.Errorf("saving the known-good kernel: %v", err))
+	}
+	if err := v.call(ctx, api.CmdRecordKnownGood, "", api.RecordKnownGoodArgs{Kernel: j.Result.BootKernel}, recordKnownGoodTimeout, nil); err != nil {
+		why := fmt.Errorf("the agent did not record %s as its known-good: %v", j.Result.BootKernel, err)
+		if !errors.Is(err, errAgentRefused) {
+			why = fmt.Errorf("%v (it may have; its previous record is known-good.json.prev on the Mac)", why)
+		}
+		v.mu.Lock()
+		v.d.KnownGood = prev
+		serr := s.store.saveDevice(&v.d, v.secretHash)
+		v.mu.Unlock()
+		if serr != nil {
+			why = fmt.Errorf("%v; and putting back labd's known-good %s failed: %v", why, prev, serr)
+		}
+		return "", failed(applied, why)
 	}
 	return line, nil
 }

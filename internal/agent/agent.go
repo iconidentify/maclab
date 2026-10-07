@@ -24,7 +24,7 @@ import (
 	"github.com/iconidentify/maclab/internal/detect"
 )
 
-const Version = "0.7.2"
+const Version = "0.7.3"
 
 type Config struct {
 	Server   string `json:"server"`
@@ -378,6 +378,16 @@ func (a *Agent) exec(ctx context.Context, c api.Command) (any, func(), error) {
 		var args api.ExecArgs
 		_ = json.Unmarshal(c.Args, &args)
 		return a.sys.Exec(ctx, args), nil, nil
+	case api.CmdRecordKnownGood:
+		var args api.RecordKnownGoodArgs
+		if err := json.Unmarshal(c.Args, &args); err != nil {
+			return nil, nil, err
+		}
+		err := a.sys.RecordKnownGood(args.Kernel)
+		a.mu.Lock()
+		a.factsRevision++ // preflight reads the record
+		a.mu.Unlock()
+		return nil, nil, err
 	case api.CmdLogs:
 		var args api.LogsArgs
 		_ = json.Unmarshal(c.Args, &args)

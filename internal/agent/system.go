@@ -33,6 +33,9 @@ type System interface {
 	// KernelConfig is the running kernel's .config (/proc/config.gz).
 	KernelConfig() (string, error)
 	Exec(ctx context.Context, a api.ExecArgs) api.ExecResult
+	// RecordKnownGood records the running kernel as known-good, as setup does,
+	// if it is kernel and not a lab boot.
+	RecordKnownGood(kernel string) error
 
 	// Reboot and Crash run after the command's result has been reported.
 	Reboot() error

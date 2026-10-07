@@ -328,6 +328,15 @@ func (v *dev) waitFor(ctx context.Context, timeout time.Duration, cond func() bo
 	}
 }
 
+// errAgentRefused matches an error the agent itself returned, as opposed to
+// the command being lost or timing out, when it may or may not have run.
+var errAgentRefused = errors.New("the agent returned an error")
+
+type agentError struct{ kind, msg string }
+
+func (e agentError) Error() string        { return e.kind + ": " + e.msg }
+func (e agentError) Is(target error) bool { return target == errAgentRefused }
+
 // call sends a command and waits for its result. It gives up early with
 // errDeviceLost if the Mac reboots or stops heartbeating.
 func (v *dev) call(ctx context.Context, kind, job string, args any, timeout time.Duration, out any) error {
@@ -455,7 +464,7 @@ func (v *dev) callNote(ctx context.Context, kind, job string, args any, timeout 
 		if res.Error == errDeviceLost.Error() {
 			return errDeviceLost
 		}
-		return fmt.Errorf("%s: %s", kind, res.Error)
+		return agentError{kind, res.Error}
 	}
 	if out != nil && len(res.Output) > 0 {
 		return json.Unmarshal(res.Output, out)

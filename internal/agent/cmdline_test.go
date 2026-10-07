@@ -63,3 +63,19 @@ func TestStockCmdlineRegexp(t *testing.T) {
 		t.Fatalf("got %q", m)
 	}
 }
+
+func TestRecordable(t *testing.T) {
+	for _, c := range []struct {
+		kernel, running, cmdline string
+		ok                       bool
+	}{
+		{"7.1.12-2-12.0-sep-ARCH", "7.1.12-2-12.0-sep-ARCH", "root=UUID=x rw quiet splash", true},
+		{"7.1.12-2-12.0-sep-ARCH", "7.1.12-2-11.31-sep-ARCH", "root=UUID=x rw quiet splash", false},
+		{"7.1.12-2-12.0-sep-ARCH", "7.1.12-2-12.0-sep-ARCH", "root=UUID=x rw maclab.job=j1006-1 panic=10", false},
+		{"", "", "root=UUID=x rw", false},
+	} {
+		if err := recordable(c.kernel, c.running, c.cmdline); (err == nil) != c.ok {
+			t.Errorf("recordable(%q, %q, %q) = %v", c.kernel, c.running, c.cmdline, err)
+		}
+	}
+}

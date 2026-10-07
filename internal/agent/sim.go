@@ -52,6 +52,12 @@ type Sim struct {
 	TestFiles   func(test, kernel string) map[string][]byte
 	DmesgErrors func(kernel string) string
 	OnExec      func(command string) (stdout string, ok bool) // answers lab exec instead of echoing
+	// DefaultKernel, once an installer has run, is what a plain reboot boots
+	// instead of SimKnownGood; RecordedKnownGood is the agent's record.
+	DefaultKernel     string
+	RecordedKnownGood string
+	// KnownGoodHook, when set, answers record_known_good instead.
+	KnownGoodHook func(kernel string) error
 	// CollectHook, when set, replaces log collection: it may write other files or fail.
 	CollectHook func(boot, outDir string) error
 	// PackagedKernels are releases installed as packages (installed-mode jobs).
@@ -207,6 +213,9 @@ func (s *Sim) boot(last string) {
 			return
 		}
 		e := simEntry{krel: SimKnownGood, behavior: "ok", cmdline: "root=UUID=sim rw"}
+		if s.DefaultKernel != "" {
+			e.krel = s.DefaultKernel
+		}
 		if s.armed != "" {
 			e = s.staged[strings.TrimPrefix(s.armed, entryPrefix)]
 			s.armed = "" // GRUB clears the one-shot before booting
@@ -427,4 +436,17 @@ func (s *Sim) omtReport(t api.TestSpec, outDir, behavior string) api.TestResult 
 	}
 	os.WriteFile(filepath.Join(outDir, "omt-report.json"), []byte(report), 0o644)
 	return api.TestResult{Name: t.Name, Passed: true, Seconds: 0.01, Tail: "omarchy-m-test 0.1.10 on " + kernel}
+}
+
+func (s *Sim) RecordKnownGood(kernel string) error {
+	if s.KnownGoodHook != nil {
+		return s.KnownGoodHook(kernel)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.kernel != kernel || strings.Contains(s.cmdline, "maclab.job=") {
+		return fmt.Errorf("running %s (%q), not %s outside a lab boot", s.kernel, s.cmdline, kernel)
+	}
+	s.RecordedKnownGood = kernel
+	return nil
 }
