@@ -58,3 +58,46 @@ func waitsFor(t *testing.T, held string) {
 		f.Close()
 	}
 }
+
+// A lock path that isn't a plain file (a symlink or FIFO planted in /tmp, a
+// directory) is refused at once: no symlink followed, no blocking open.
+func TestBootPartitionLockRefusesNonRegularFiles(t *testing.T) {
+	for name, plant := range map[string]func(p, dir string) error{
+		"symlink":   func(p, dir string) error { return os.Symlink(filepath.Join(dir, "victim"), p) },
+		"fifo":      func(p, _ string) error { return unix.Mkfifo(p, 0o644) },
+		"directory": func(p, _ string) error { return os.Mkdir(p, 0o755) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			bootPartitionLocks = []string{filepath.Join(dir, "boot-partition.lock"), filepath.Join(dir, "limine-global.lock")}
+			if err := plant(bootPartitionLocks[1], dir); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() {
+				unlock, err := lockBootPartition(2 * time.Second)
+				if err == nil {
+					unlock()
+				}
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("locked through a non-regular file")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("blocked on the lock path")
+			}
+			if _, err := os.Lstat(filepath.Join(dir, "victim")); err == nil {
+				t.Fatal("followed the symlink and created its target")
+			}
+			// the first lock was released
+			f, _ := os.OpenFile(bootPartitionLocks[0], os.O_RDWR, 0)
+			defer f.Close()
+			if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+				t.Fatal("first lock not released after the refusal")
+			}
+		})
+	}
+}

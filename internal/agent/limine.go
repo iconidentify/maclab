@@ -157,10 +157,17 @@ func lockBootPartition(timeout time.Duration) (func(), error) {
 	}
 	for _, path := range bootPartitionLocks {
 		os.MkdirAll(filepath.Dir(path), 0o755)
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+		// /tmp and /run/lock are world-writable: never follow a symlink planted
+		// there, never block opening a FIFO, and lock only a regular file
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0o644)
 		if err != nil {
 			release()
-			return nil, err
+			return nil, fmt.Errorf("lock %s: %w", path, err)
+		}
+		if st, err := f.Stat(); err != nil || !st.Mode().IsRegular() {
+			f.Close()
+			release()
+			return nil, fmt.Errorf("lock %s is not a regular file; refusing to use it", path)
 		}
 		for unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB) != nil {
 			if time.Now().After(deadline) {
